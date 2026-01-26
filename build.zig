@@ -22,6 +22,7 @@ const examples = [_]Example{
     .{ .name = "transparent" },
     .{ .name = "testexample" },
     .{ .name = "text", .needs_text = true },
+    .{ .name = "raster" },
 };
 
 pub fn build(b: *std.Build) void {
