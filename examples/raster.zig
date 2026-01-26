@@ -1,4 +1,34 @@
-const raster_size: XY(u16) = .{ .x = 256, .y = 128 };
+pub const RenderTarget = struct {
+    buf: []Color,
+    size: XY(u16),
+
+    pub const Color = packed struct {
+        b: u8,
+        g: u8,
+        r: u8,
+        _pad: u8 = 0,
+    };
+
+    pub fn init(gpa: Allocator, size: XY(u16)) !@This() {
+        return .{
+            .buf = try gpa.alloc(Color, @as(usize, size.x) * @as(usize, size.y)),
+            .size = size,
+        };
+    }
+
+    pub fn deinit(self: *@This(), gpa: Allocator) void {
+        gpa.free(self.buf);
+        self.* = undefined;
+    }
+
+    pub fn clear(self: @This(), color: Color) void {
+        @memset(self.buf, color);
+    }
+
+    pub fn bytes(self: @This()) []u8 {
+        return @ptrCast(self.buf);
+    }
+};
 
 const Ids = struct {
     base: x11.ResourceBase,
@@ -57,7 +87,7 @@ pub fn main() !void {
     var sink: x11.RequestSink = .{ .writer = &socket_writer.interface };
     var source: x11.Source = .initAfterSetup(socket_reader.interface());
 
-    var window_size: XY(u16) = raster_size;
+    var window_size: XY(u16) = .{ .x = 256, .y = 128 };
 
     try sink.CreateWindow(
         .{
@@ -104,14 +134,14 @@ pub fn main() !void {
 
     try sink.MapWindow(ids.window());
 
-    const raster_buf = try std.heap.page_allocator.alloc(u8, @as(usize, raster_size.x) * @as(usize, raster_size.y) * 4);
-    defer std.heap.page_allocator.free(raster_buf);
+    var rt: RenderTarget = try .init(std.heap.page_allocator, window_size);
+    defer rt.deinit(std.heap.page_allocator);
 
     const raster_pixmap = ids.rasterPixmap();
     try sink.CreatePixmap(raster_pixmap, ids.window().drawable(), .{
         .depth = .@"24",
-        .width = raster_size.x,
-        .height = raster_size.y,
+        .width = rt.size.x,
+        .height = rt.size.y,
     });
     const raster_gc = ids.rasterGc();
     try sink.CreateGc(raster_gc, raster_pixmap.drawable(), .{});
@@ -162,7 +192,7 @@ pub fn main() !void {
                 ids,
                 dbe,
                 window_size,
-                raster_buf,
+                rt,
             );
         }
     }
@@ -176,7 +206,7 @@ fn render(
     ids: Ids,
     dbe: Dbe,
     window_size: XY(u16),
-    raster_buf: []u8,
+    rt: RenderTarget,
 ) !void {
     const window = ids.window();
     const gc = ids.gc();
@@ -195,18 +225,18 @@ fn render(
     }
     const drawable: x11.Drawable = if (dbe.backBuffer()) |back_buffer| back_buffer else window.drawable();
 
-    @memset(raster_buf, 0xff);
+    rt.clear(.{ .r = 0xff, .g = 0x00, .b = 0x00 });
 
     try sink.PutImage(.{
         .format = .z_pixmap,
         .drawable = ids.rasterPixmap().drawable(),
         .gc_id = ids.rasterGc(),
-        .width = raster_size.x,
-        .height = raster_size.y,
+        .width = rt.size.x,
+        .height = rt.size.y,
         .x = 0,
         .y = 0,
         .depth = .@"24",
-    }, .init(raster_buf.ptr, @intCast(raster_buf.len)));
+    }, .init(rt.bytes().ptr, @intCast(rt.bytes().len)));
 
     try sink.CopyArea(.{
         .src_drawable = ids.rasterPixmap().drawable(),
@@ -216,8 +246,8 @@ fn render(
         .src_y = 0,
         .dst_x = 0,
         .dst_y = 0,
-        .width = raster_size.x,
-        .height = raster_size.y,
+        .width = rt.size.x,
+        .height = rt.size.y,
     });
 
     switch (dbe) {
