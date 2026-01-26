@@ -1,6 +1,6 @@
 pub const RenderTarget = struct {
     buf: []Color,
-    size: XY(u16),
+    size: XY(u32),
 
     pub const Color = packed struct {
         b: u8,
@@ -9,7 +9,7 @@ pub const RenderTarget = struct {
         _pad: u8 = 0,
     };
 
-    pub fn init(gpa: Allocator, size: XY(u16)) !@This() {
+    pub fn init(gpa: Allocator, size: XY(u32)) !@This() {
         return .{
             .buf = try gpa.alloc(Color, @as(usize, size.x) * @as(usize, size.y)),
             .size = size,
@@ -23,6 +23,16 @@ pub const RenderTarget = struct {
 
     pub fn clear(self: @This(), color: Color) void {
         @memset(self.buf, color);
+    }
+
+    pub fn fillRect(self: @This(), rect: x11.Rectangle, color: Color) void {
+        const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
+        const x_max: u32 = @intCast(clamp(@as(i64, rect.x) + rect.width, 0, self.size.x));
+        const y_min: u32 = @intCast(clamp(@as(i64, rect.y), 0, self.size.y));
+        const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height, 0, self.size.y));
+        for (y_min..y_max) |y| {
+            @memset(self.buf[y * self.size.x + x_min ..][0 .. x_max - x_min], color);
+        }
     }
 
     pub fn bytes(self: @This()) []u8 {
@@ -134,14 +144,17 @@ pub fn main() !void {
 
     try sink.MapWindow(ids.window());
 
-    var rt: RenderTarget = try .init(std.heap.page_allocator, window_size);
+    var rt: RenderTarget = try .init(std.heap.page_allocator, .{
+        .x = @intCast(window_size.x),
+        .y = @intCast(window_size.y),
+    });
     defer rt.deinit(std.heap.page_allocator);
 
     const raster_pixmap = ids.rasterPixmap();
     try sink.CreatePixmap(raster_pixmap, ids.window().drawable(), .{
         .depth = .@"24",
-        .width = rt.size.x,
-        .height = rt.size.y,
+        .width = @intCast(rt.size.x),
+        .height = @intCast(rt.size.y),
     });
     const raster_gc = ids.rasterGc();
     try sink.CreateGc(raster_gc, raster_pixmap.drawable(), .{});
@@ -226,13 +239,23 @@ fn render(
     const drawable: x11.Drawable = if (dbe.backBuffer()) |back_buffer| back_buffer else window.drawable();
 
     rt.clear(.{ .r = 0xff, .g = 0x00, .b = 0x00 });
+    rt.fillRect(.{
+        .x = 100,
+        .y = 100,
+        .width = 10,
+        .height = 100,
+    }, .{
+        .r = 0x00,
+        .g = 0x00,
+        .b = 0xff,
+    });
 
     try sink.PutImage(.{
         .format = .z_pixmap,
         .drawable = ids.rasterPixmap().drawable(),
         .gc_id = ids.rasterGc(),
-        .width = rt.size.x,
-        .height = rt.size.y,
+        .width = @intCast(rt.size.x),
+        .height = @intCast(rt.size.y),
         .x = 0,
         .y = 0,
         .depth = .@"24",
@@ -246,8 +269,8 @@ fn render(
         .src_y = 0,
         .dst_x = 0,
         .dst_y = 0,
-        .width = rt.size.x,
-        .height = rt.size.y,
+        .width = @intCast(rt.size.x),
+        .height = @intCast(rt.size.y),
     });
 
     switch (dbe) {
@@ -289,3 +312,4 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Cmdline = @import("Cmdline.zig");
+const clamp = std.math.clamp;
