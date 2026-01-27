@@ -6,7 +6,7 @@ pub const RenderTarget = struct {
         b: u8,
         g: u8,
         r: u8,
-        _pad: u8 = 0,
+        a: u8,
     };
 
     pub fn init(gpa: Allocator, size: XY(u32)) !@This() {
@@ -25,18 +25,69 @@ pub const RenderTarget = struct {
         @memset(self.buf, color);
     }
 
+    // XXX: would premul make it faster, or does that require no alpha output?
+    // XXX: pull blend out into helper once it works and is fast
+    // XXX: vectorize?
+    // XXX: document that we're emulating what gpus do (e.g. not doing gamma or color space correction before blending)
     pub fn fillRect(self: @This(), rect: x11.Rectangle, color: Color) void {
+        // Clamp the bounds to the render target
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
         const x_max: u32 = @intCast(clamp(@as(i64, rect.x) + rect.width, 0, self.size.x));
         const y_min: u32 = @intCast(clamp(@as(i64, rect.y), 0, self.size.y));
         const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height, 0, self.size.y));
+
+        // Fast path for when alpha blending isn't required
+        if (color.a == 0xff) {
+            for (y_min..y_max) |y| {
+                @memset(self.buf[y * self.size.x + x_min ..][0 .. x_max - x_min], color);
+            }
+            return;
+        }
+
+        // Alpha blended implementation
+        const src_r = unormToFloat(color.r);
+        const src_g = unormToFloat(color.g);
+        const src_b = unormToFloat(color.b);
+        const src_a = unormToFloat(color.a);
+
         for (y_min..y_max) |y| {
-            @memset(self.buf[y * self.size.x + x_min ..][0 .. x_max - x_min], color);
+            const row_start = y * self.size.x;
+            for (self.buf[row_start + x_min .. row_start + x_max]) |*dst| {
+                const dst_r = unormToFloat(dst.r);
+                const dst_g = unormToFloat(dst.g);
+                const dst_b = unormToFloat(dst.b);
+                const dst_a = unormToFloat(dst.a);
+
+                const new_r = src_r * src_a + dst_r * dst_a * (1.0 - src_a);
+                const new_g = src_g * src_a + dst_g * dst_a * (1.0 - src_a);
+                const new_b = src_b * src_a + dst_b * dst_a * (1.0 - src_a);
+                const new_a = src_a + dst_a * (1.0 - src_a);
+
+                dst.* = .{
+                    .r = floatToUnorm(new_r),
+                    .g = floatToUnorm(new_g),
+                    .b = floatToUnorm(new_b),
+                    .a = floatToUnorm(new_a),
+                };
+            }
         }
     }
 
     pub fn bytes(self: @This()) []u8 {
         return @ptrCast(self.buf);
+    }
+
+    // XXX: remove once no longer using floats
+    // Fast but exact unorm to float.
+    fn unormToFloat(u: u8) f32 {
+        const max: f32 = @floatFromInt(255);
+        const r: f32 = 1.0 / (3.0 * max);
+        return @as(f32, @floatFromInt(u)) * 3.0 * r;
+    }
+
+    // Exact float to unorm.
+    fn floatToUnorm(f: f32) u8 {
+        return @intFromFloat(f * 255 + 0.5);
     }
 };
 
@@ -238,7 +289,7 @@ fn render(
     }
     const drawable: x11.Drawable = if (dbe.backBuffer()) |back_buffer| back_buffer else window.drawable();
 
-    rt.clear(.{ .r = 0xff, .g = 0x00, .b = 0x00 });
+    rt.clear(.{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xff });
     rt.fillRect(.{
         .x = 100,
         .y = 100,
@@ -248,6 +299,7 @@ fn render(
         .r = 0x00,
         .g = 0x00,
         .b = 0xff,
+        .a = 0xff / 4,
     });
 
     try sink.PutImage(.{
