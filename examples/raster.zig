@@ -2,6 +2,9 @@
 // XXX: consider comparing ot preompocuting, need to profile in general
 // XXX: vectorize? bin on threads?
 // XXX: compare to f32 version visually, and benchmark
+// XXX: we could bin this if we need more speed, but i suspect that it will be plenty fast. need to
+// divide into multiple copy areas somehow if we want to test visually but idk if we really can from one
+// buffer. i guess we could just not worry about the visuals for that test.
 pub const RenderTarget = struct {
     buf: []Color,
     size: XY(u32),
@@ -187,6 +190,48 @@ pub const RenderTarget = struct {
         }
     }
 
+    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: i16, color: Color) void {
+        // Clamp the bounds to the render target
+        const x_min: u32 = @intCast(clamp(@as(i64, center.x) - radius, 0, self.size.x));
+        const x_max: u32 = @intCast(clamp(@as(i64, center.x) + radius, 0, self.size.x));
+        const y_min: u32 = @intCast(clamp(@as(i64, center.y) - radius, 0, self.size.y));
+        const y_max: u32 = @intCast(clamp(@as(i64, center.y) + radius, 0, self.size.y));
+
+        // XXX: actually fill a circle
+        // XXX: one way to do this is to calculate the distance to the center, that'll also give
+        // us antialiasing, but that involves a square root right? or can we do it with no sqrt by
+        // squaring the dist up front? actually that may work and not even need to be undone because
+        // it's very close to the gamma correction amount..interesting idea
+        // XXX: ideally we actually start the iteration at the correct x point rather than having to go
+        // the whole span
+        // XXX: let's do the sqrt first then try that as an optimization and look up any other existing
+        // strategies
+        // XXX: if we DO use floats, we can use our fast sqrt/inv sqrt stuff, but we can probably avoid it
+        // Fill in the circle
+        // XXX: profile blend operating on a pointer vs not?
+        // XXX: precalc some of the color at least and just chance the alpha at the end? that will be useful
+        // for many of these shapes. may also just precalc the different aa levels.
+        const center_x_f: f32 = @floatFromInt(center.x);
+        const center_y_f: f32 = @floatFromInt(center.y);
+        const r_f: f32 = @floatFromInt(radius);
+        for (y_min..y_max) |y| {
+            const row_start = y * self.size.x;
+            for (x_min..x_max) |x| {
+                const x_f: f32 = @floatFromInt(x);
+                const y_f: f32 = @floatFromInt(y);
+                const dx = x_f - center_x_f;
+                const dy = y_f - center_y_f;
+                const d = @sqrt(dx * dx + dy * dy);
+                if (d < r_f) {
+                    var color_aa = color;
+                    color_aa.a = @intFromFloat(clamp(r_f * 255 * (r_f - d) / r_f, 0, 255));
+                    const dst = &self.buf[row_start + x];
+                    dst.* = dst.blend(color_aa.premul());
+                }
+            }
+        }
+    }
+
     pub fn bytes(self: @This()) []u8 {
         return @ptrCast(self.buf);
     }
@@ -267,9 +312,6 @@ pub fn main() !void {
         .{
             .bg_pixel = screen.depth.rgbFrom24(0),
             .event_mask = .{
-                .ButtonPress = 1,
-                .ButtonRelease = 1,
-                .PointerMotion = 1,
                 .Exposure = 1,
                 .StructureNotify = 1,
             },
@@ -402,6 +444,12 @@ fn render(
         .b = 0xff,
         .a = 0xff / 4,
     });
+
+    rt.fillCircle(
+        .{ .x = 100, .y = 100 },
+        50,
+        .{ .r = 0x00, .g = 0x00, .b = 0xff, .a = 0xff },
+    );
 
     try sink.PutImage(.{
         .format = .z_pixmap,
