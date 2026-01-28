@@ -1,13 +1,150 @@
+// XXX: get tests running, maybe disable slow tests by default
+// XXX: consider comparing ot preompocuting, need to profile in general
+// XXX: vectorize? bin on threads?
+// XXX: compare to f32 version visually, and benchmark
 pub const RenderTarget = struct {
     buf: []Color,
     size: XY(u32),
 
-    pub const Color = packed struct {
+    const Color = packed struct(u32) {
         b: u8,
         g: u8,
         r: u8,
         a: u8,
+
+        pub const Premultiplied = packed struct(u32) {
+            b: u8,
+            g: u8,
+            r: u8,
+            a: u8,
+        };
+
+        /// Efficiently blends source onto destination, emulating the alpha blending you'd get from
+        /// alpha blending on a GPU. When possible, cache the premultiplied source outside of your hot
+        /// loop.
+        ///
+        /// Note: This method is intended for real time use. If you can afford a more expensive blend
+        /// or are building a tool that will be used by artists, you should not be calling this method,
+        /// you should be blending in a perceptual space like Oklab or at least doing sRGB correction
+        /// before you call this method.
+        pub fn blend(dst: Color, src_premul: Premultiplied) Color {
+            const dst_scaled = dst.scale(0xff - src_premul.a);
+            return .{
+                .r = src_premul.r + dst_scaled.r,
+                .g = src_premul.g + dst_scaled.g,
+                .b = src_premul.b + dst_scaled.b,
+                .a = src_premul.a + dst_scaled.a,
+            };
+        }
+
+        /// Efficiently scales the color channels by the alpha channel.
+        pub fn premul(self: Color) Premultiplied {
+            var bgr = self;
+            bgr.a = 0xff;
+            return @bitCast(bgr.scale(self.a));
+        }
+
+        /// Efficiently scales all channels by the given unorm factor.
+        ///
+        /// Adapted from "Alpha Blending with No Division Operations" by Jerry R. Van Aken:
+        ///
+        /// https://arxiv.org/pdf/2202.02864
+        pub fn scale(self: Color, factor: u8) Color {
+            comptime assert(builtin.cpu.arch.endian() == .little);
+            const bgra: u32 = @bitCast(self);
+
+            var br = bgra & 0x00ff00ff;
+            br *= factor;
+            br += 0x00800080;
+            br += (br >> 8) & 0x00ff00ff;
+            br &= 0xff00ff00;
+
+            var ga = (bgra >> 8) & 0x00ff00ff;
+            ga *= factor;
+            ga += 0x00800080;
+            ga += (ga >> 8) & 0x00ff00ff;
+            ga &= 0xff00ff00;
+
+            return @bitCast(ga | (br >> 8));
+        }
+
+        /// Equivalent to `premul`, but internally computes the result using floating point. This is
+        /// slow, used only as a test oracle.
+        fn premulF32(self: Color) Premultiplied {
+            var bgr = self;
+            bgr.a = 0xff;
+            return @bitCast(bgr.scaleF32(self.a));
+        }
+
+        fn scaleF32(color: Color, factor: u8) Color {
+            return .{
+                .r = unormTimesUnormF32(factor, color.r),
+                .g = unormTimesUnormF32(factor, color.g),
+                .b = unormTimesUnormF32(factor, color.b),
+                .a = unormTimesUnormF32(factor, color.a),
+            };
+        }
+
+        /// Multiplies two unorms by temporarily converting to f32. This is slow, used only as a test
+        /// oracle.
+        fn unormTimesUnormF32(alpha: u8, red: u8) u8 {
+            const a: f32 = @floatFromInt(alpha);
+            const r: f32 = @floatFromInt(red);
+            return @intFromFloat(@round((a * r) / 255));
+        }
+
+        test premul {
+            // We can afford to just test every possible premul to make sure we go this right, so let's
+            // do it.
+            for (0x00..0xff) |r| {
+                for (0x00..0xff) |g| {
+                    for (0x00..0xff) |b| {
+                        for (0x00..0xff) |a| {
+                            const c: Color = .{
+                                .r = @intCast(r),
+                                .g = @intCast(g),
+                                .b = @intCast(b),
+                                .a = @intCast(a),
+                            };
+                            const expected = c.premulF32();
+                            const found = c.premul();
+                            try std.testing.expectEqual(expected, found);
+                        }
+                    }
+                }
+            }
+        }
+
+        test scale {
+            // The premul test is already pretty exhaustive, we just need to check a few cases where we
+            // are also scaling the alpha channel. Since there's an extra level of nesting here we
+            // don't want to check every single value.
+            for (0..5) |r| {
+                const r8: u8 = @intCast(r * 255 / 4);
+                for (0..5) |g| {
+                    const g8: u8 = @intCast(g * 255 / 4);
+                    for (0..5) |b| {
+                        const b8: u8 = @intCast(b * 255 / 4);
+                        for (0..5) |a| {
+                            const a8: u8 = @intCast(a * 255 / 4);
+                            for (0..5) |f| {
+                                const f8: u8 = @intCast(f * 255 / 4);
+                                const c: Color = .{ .r = r8, .g = g8, .b = b8, .a = a8 };
+                                try std.testing.expectEqual(
+                                    c.scaleF32(f8),
+                                    c.scale(f8),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     };
+
+    test {
+        _ = Color;
+    }
 
     pub fn init(gpa: Allocator, size: XY(u32)) !@This() {
         return .{
@@ -25,10 +162,6 @@ pub const RenderTarget = struct {
         @memset(self.buf, color);
     }
 
-    // XXX: would premul make it faster, or does that require no alpha output?
-    // XXX: pull blend out into helper once it works and is fast
-    // XXX: vectorize?
-    // XXX: document that we're emulating what gpus do (e.g. not doing gamma or color space correction before blending)
     pub fn fillRect(self: @This(), rect: x11.Rectangle, color: Color) void {
         // Clamp the bounds to the render target
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
@@ -45,49 +178,17 @@ pub const RenderTarget = struct {
         }
 
         // Alpha blended implementation
-        const src_r = unormToFloat(color.r);
-        const src_g = unormToFloat(color.g);
-        const src_b = unormToFloat(color.b);
-        const src_a = unormToFloat(color.a);
-
+        const color_p = color.premul();
         for (y_min..y_max) |y| {
             const row_start = y * self.size.x;
             for (self.buf[row_start + x_min .. row_start + x_max]) |*dst| {
-                const dst_r = unormToFloat(dst.r);
-                const dst_g = unormToFloat(dst.g);
-                const dst_b = unormToFloat(dst.b);
-                const dst_a = unormToFloat(dst.a);
-
-                const new_r = src_r * src_a + dst_r * dst_a * (1.0 - src_a);
-                const new_g = src_g * src_a + dst_g * dst_a * (1.0 - src_a);
-                const new_b = src_b * src_a + dst_b * dst_a * (1.0 - src_a);
-                const new_a = src_a + dst_a * (1.0 - src_a);
-
-                dst.* = .{
-                    .r = floatToUnorm(new_r),
-                    .g = floatToUnorm(new_g),
-                    .b = floatToUnorm(new_b),
-                    .a = floatToUnorm(new_a),
-                };
+                dst.* = dst.blend(color_p);
             }
         }
     }
 
     pub fn bytes(self: @This()) []u8 {
         return @ptrCast(self.buf);
-    }
-
-    // XXX: remove once no longer using floats
-    // Fast but exact unorm to float.
-    fn unormToFloat(u: u8) f32 {
-        const max: f32 = @floatFromInt(255);
-        const r: f32 = 1.0 / (3.0 * max);
-        return @as(f32, @floatFromInt(u)) * 3.0 * r;
-    }
-
-    // Exact float to unorm.
-    fn floatToUnorm(f: f32) u8 {
-        return @intFromFloat(f * 255 + 0.5);
     }
 };
 
@@ -356,6 +457,7 @@ fn oom(e: error{OutOfMemory}) noreturn {
     @panic(@errorName(e));
 }
 
+const builtin = @import("builtin");
 const std = @import("std");
 const x11 = @import("x11");
 const XY = x11.XY;
