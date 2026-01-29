@@ -190,10 +190,40 @@ pub const RenderTarget = struct {
         }
     }
 
+    // XXX: ideas:
+    // 1. sqrt once per scanline to find the start and end coords, and then use memset, and just do
+    // extra work around the edges for antialiasing. actually we can only use memset for fully opaque
+    // colors but that's fine that's the common case, then we can fall back to blending when needed.
+    // 2. can bresenham help us avoid the sqrt? we calso can cache results cause of symmetry
+    // XXX: plan:
+    // 0. does our no sqrt trick where we compare to the squared distance and also use that value for AA work? look
+    // into that first. if this works document why it works. make sure the gamma really is the right direction or
+    // cache that part or whatever.
+    //     - hmm the dist between the squares depends on the radius, however, the radius is known so we should be able
+    //       to correct for this right? what would we have to cache? some scale factor? like it's okay even desirable
+    //       that it's nonlinear i think, double check that, we just need a scale for uniformity across radii?
+    //     - ah yeah you just scale by the radius before doing the math!
+    //     - let's make sure this is the right direction for gamma
+    //     - i think ti's the wrong direction...linear to srgb raises to 1/2.2 roughly, whereas this
+    //       raises to 2
+    // 1. start by just moving the sqrt to be once per line, no AA, use memset where possible
+    //    - so the goal is to figure out the start offset, and then we mirror that for the end offset of the scanline
+    //    - let's start there
+    //    - so... we know y, we want to find x, we know r, x^2 + y^2 = r^2
+    //      x^2 + y^2 = r^2
+    //      x^2 = r^2 - y^2
+    //      x_off = sqrt(r^2 - y^2)
+    //      x_min = x + radius - x_off
+    //      x_max = x + radius + x_off
+    //    - easy, just one sqrt per scanline, and could even mirror to halve the count if we wanted
+    //    - let's try this with no aa first
+    //    - [ ] need to make sure clamping doens't mess up aa
+    // 2. then figure out how to add (coverage based?) AA back in
+    // 3. then figure out if we can avoid or reuse the sqrts with symmetry
+    // 4. then figure out if we can cache the colors or parts of them
+    // 5. Look into the circle drawing algorithm where it steps we could do scanlines with that, idk if it antialiases though?
     pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: i16, color: Color) void {
         // Clamp the bounds to the render target
-        const x_min: u32 = @intCast(clamp(@as(i64, center.x) - radius, 0, self.size.x));
-        const x_max: u32 = @intCast(clamp(@as(i64, center.x) + radius, 0, self.size.x));
         const y_min: u32 = @intCast(clamp(@as(i64, center.y) - radius, 0, self.size.y));
         const y_max: u32 = @intCast(clamp(@as(i64, center.y) + radius, 0, self.size.y));
 
@@ -211,24 +241,18 @@ pub const RenderTarget = struct {
         // XXX: profile blend operating on a pointer vs not?
         // XXX: precalc some of the color at least and just chance the alpha at the end? that will be useful
         // for many of these shapes. may also just precalc the different aa levels.
-        const center_x_f: f32 = @floatFromInt(center.x);
-        const center_y_f: f32 = @floatFromInt(center.y);
-        const r_f: f32 = @floatFromInt(radius);
+        // const center_x_f: f32 = @floatFromInt(center.x);
+        // const center_y_f: f32 = @floatFromInt(center.y);
+        const r: f32 = @floatFromInt(radius);
+        const r_sq = r * r;
+        const y_mid: f32 = @floatFromInt(center.y);
+        const x_mid: i64 = center.x;
         for (y_min..y_max) |y| {
-            const row_start = y * self.size.x;
-            for (x_min..x_max) |x| {
-                const x_f: f32 = @floatFromInt(x);
-                const y_f: f32 = @floatFromInt(y);
-                const dx = x_f - center_x_f;
-                const dy = y_f - center_y_f;
-                const d = @sqrt(dx * dx + dy * dy);
-                if (d < r_f) {
-                    var color_aa = color;
-                    color_aa.a = @intFromFloat(clamp(r_f * 255 * (r_f - d) / r_f, 0, 255));
-                    const dst = &self.buf[row_start + x];
-                    dst.* = dst.blend(color_aa.premul());
-                }
-            }
+            const dy = @as(f32, @floatFromInt(y)) - y_mid;
+            const x_off: i64 = @intFromFloat(@sqrt(@abs(r_sq - dy * dy)));
+            const x_min: u32 = @intCast(clamp(x_mid - x_off, 0, self.size.x));
+            const x_max: u32 = @intCast(clamp(x_mid + x_off, 0, self.size.x));
+            @memset(self.buf[self.size.x * y + x_min ..][0 .. x_max - x_min], color);
         }
     }
 
