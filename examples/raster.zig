@@ -42,6 +42,7 @@ pub const RenderTarget = struct {
 
         /// Efficiently scales the color channels by the alpha channel.
         pub fn premul(self: Color) Premultiplied {
+            if (self.a == 0xff) return @bitCast(self);
             var bgr = self;
             bgr.a = 0xff;
             return @bitCast(bgr.scale(self.a));
@@ -172,87 +173,107 @@ pub const RenderTarget = struct {
         const y_min: u32 = @intCast(clamp(@as(i64, rect.y), 0, self.size.y));
         const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height, 0, self.size.y));
 
-        // Fast path for when alpha blending isn't required
-        if (color.a == 0xff) {
-            for (y_min..y_max) |y| {
-                @memset(self.buf[y * self.size.x + x_min ..][0 .. x_max - x_min], color);
-            }
-            return;
-        }
-
-        // Alpha blended implementation
+        // Premultiply the color
         const color_p = color.premul();
+
+        // Fill the rect
         for (y_min..y_max) |y| {
-            const row_start = y * self.size.x;
-            for (self.buf[row_start + x_min .. row_start + x_max]) |*dst| {
-                dst.* = dst.blend(color_p);
+            self.fillScanline(x_min, x_max, @intCast(y), color_p);
+        }
+    }
+
+    // XXX: test htat if it's 1px wide it actually is on the righ tpixel
+    // XXX: profile blend operating on a pointer vs not?
+    // XXX: i think we could step avoiding all sqrts using one of those algorithsm then continue with
+    // the scanline fill mirroring, but, probably overkill if it's complex?
+    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u32, color: Color) void {
+        // Precompute values we'll use in the hot loop
+        const center_x: i64 = center.x;
+        const r: f32 = @floatFromInt(radius);
+        const r_sq = r * r;
+        const x_mid: f32 = @floatFromInt(center.x);
+        const y_mid: f32 = @floatFromInt(center.y);
+        const color_p = color.premul();
+        const alpha: f32 = @floatFromInt(color.a);
+
+        // Clamp the vertical bounds to the render target
+        const y_min: u32 = @intCast(clamp(@as(i64, center.y) - radius, 0, self.size.y));
+        const y_max: u32 = @intCast(clamp(@as(i64, center.y) + radius, 0, self.size.y));
+
+        // Iterate over the scanlines
+        for (y_min..y_max) |y| {
+            // Figure out the width of this scanline
+            const dy = @as(f32, @floatFromInt(y)) - y_mid;
+            const dy2 = dy * dy;
+            const radius_x: u32 = @intFromFloat(@ceil(@sqrt(r_sq - dy2)));
+            const x_min: i64 = center_x - radius_x + 1;
+            const x_max: i64 = center_x + radius_x;
+
+            // XXX: don't go from 0 to radius, start in the non clipped region
+            // Fill in the scanline
+            for (0..radius_x) |i| {
+                // Calculate the left and right x coordinates
+                const left_x: i64 = x_min + @as(u32, @intCast(i));
+                const right_x: i64 = x_max - @as(u32, @intCast(i));
+
+                // Clip the left and right x coordintes
+                const left_clipped = left_x < 0 or left_x >= self.size.x;
+                const right_clipped = left_x == right_x or right_x < 0 or right_x >= self.size.x;
+
+                // Calculate the coverage
+                const x: f32 = @floatFromInt(left_x);
+                const dx = x_mid - x;
+                const dx2 = dx * dx;
+                const d2 = dy2 + dx2;
+                const d = @sqrt(d2);
+                const coverage = clamp(r - d, 0, 1);
+
+                // If the coverage is 1, we're past the antialiased region and should just fill in
+                // the rest of the scanline at full opacity.
+                if (coverage == 1) {
+                    // Clip the left and right sides of the flood fill
+                    // XXX: clip correctly, check this math not sure why +1 for example
+                    const fill_left_unclamped = @as(i64, left_x);
+                    const fill_right_unclamped = @as(i64, @intCast(x_max)) + 1 - @as(i64, @intCast(i));
+                    const fill_left: u32 = @intCast(clamp(fill_left_unclamped, 0, self.size.x));
+                    const fill_right: u32 = @intCast(clamp(fill_right_unclamped, 0, self.size.x));
+                    self.fillScanline(fill_left, fill_right, @intCast(y), color_p);
+                    break;
+                }
+
+                // Calculate the antialiased color
+                const color_aa = Color.premul(.{
+                    .r = color.r,
+                    .g = color.g,
+                    .b = color.b,
+                    .a = @intFromFloat(coverage * alpha),
+                });
+
+                // Blend with the render target. The casts are safe when not clipped.
+                const row_index = self.size.x * y;
+                if (!left_clipped) {
+                    const sample = &self.buf[row_index + @as(usize, @intCast(left_x))];
+                    sample.* = sample.*.blend(color_aa);
+                }
+                if (!right_clipped) {
+                    const sample = &self.buf[row_index + @as(usize, @intCast(right_x))];
+                    sample.* = sample.*.blend(color_aa);
+                }
             }
         }
     }
 
-    // XXX: ideas:
-    // 1. sqrt once per scanline to find the start and end coords, and then use memset, and just do
-    // extra work around the edges for antialiasing. actually we can only use memset for fully opaque
-    // colors but that's fine that's the common case, then we can fall back to blending when needed.
-    // 2. can bresenham help us avoid the sqrt? we calso can cache results cause of symmetry
-    // XXX: plan:
-    // 0. does our no sqrt trick where we compare to the squared distance and also use that value for AA work? look
-    // into that first. if this works document why it works. make sure the gamma really is the right direction or
-    // cache that part or whatever.
-    //     - hmm the dist between the squares depends on the radius, however, the radius is known so we should be able
-    //       to correct for this right? what would we have to cache? some scale factor? like it's okay even desirable
-    //       that it's nonlinear i think, double check that, we just need a scale for uniformity across radii?
-    //     - ah yeah you just scale by the radius before doing the math!
-    //     - let's make sure this is the right direction for gamma
-    //     - i think ti's the wrong direction...linear to srgb raises to 1/2.2 roughly, whereas this
-    //       raises to 2
-    // 1. start by just moving the sqrt to be once per line, no AA, use memset where possible
-    //    - so the goal is to figure out the start offset, and then we mirror that for the end offset of the scanline
-    //    - let's start there
-    //    - so... we know y, we want to find x, we know r, x^2 + y^2 = r^2
-    //      x^2 + y^2 = r^2
-    //      x^2 = r^2 - y^2
-    //      x_off = sqrt(r^2 - y^2)
-    //      x_min = x + radius - x_off
-    //      x_max = x + radius + x_off
-    //    - easy, just one sqrt per scanline, and could even mirror to halve the count if we wanted
-    //    - let's try this with no aa first
-    //    - [ ] need to make sure clamping doens't mess up aa
-    // 2. then figure out how to add (coverage based?) AA back in
-    // 3. then figure out if we can avoid or reuse the sqrts with symmetry
-    // 4. then figure out if we can cache the colors or parts of them
-    // 5. Look into the circle drawing algorithm where it steps we could do scanlines with that, idk if it antialiases though?
-    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: i16, color: Color) void {
-        // Clamp the bounds to the render target
-        const y_min: u32 = @intCast(clamp(@as(i64, center.y) - radius, 0, self.size.y));
-        const y_max: u32 = @intCast(clamp(@as(i64, center.y) + radius, 0, self.size.y));
-
-        // XXX: actually fill a circle
-        // XXX: one way to do this is to calculate the distance to the center, that'll also give
-        // us antialiasing, but that involves a square root right? or can we do it with no sqrt by
-        // squaring the dist up front? actually that may work and not even need to be undone because
-        // it's very close to the gamma correction amount..interesting idea
-        // XXX: ideally we actually start the iteration at the correct x point rather than having to go
-        // the whole span
-        // XXX: let's do the sqrt first then try that as an optimization and look up any other existing
-        // strategies
-        // XXX: if we DO use floats, we can use our fast sqrt/inv sqrt stuff, but we can probably avoid it
-        // Fill in the circle
-        // XXX: profile blend operating on a pointer vs not?
-        // XXX: precalc some of the color at least and just chance the alpha at the end? that will be useful
-        // for many of these shapes. may also just precalc the different aa levels.
-        // const center_x_f: f32 = @floatFromInt(center.x);
-        // const center_y_f: f32 = @floatFromInt(center.y);
-        const r: f32 = @floatFromInt(radius);
-        const r_sq = r * r;
-        const y_mid: f32 = @floatFromInt(center.y);
-        const x_mid: i64 = center.x;
-        for (y_min..y_max) |y| {
-            const dy = @as(f32, @floatFromInt(y)) - y_mid;
-            const x_off: i64 = @intFromFloat(@sqrt(@abs(r_sq - dy * dy)));
-            const x_min: u32 = @intCast(clamp(x_mid - x_off, 0, self.size.x));
-            const x_max: u32 = @intCast(clamp(x_mid + x_off, 0, self.size.x));
-            @memset(self.buf[self.size.x * y + x_min ..][0 .. x_max - x_min], color);
+    /// Fills the scanline using memset if possible, falling back to a for loop if alpha blending is
+    /// required. Inputs must be clamped in advance.
+    pub fn fillScanline(self: @This(), x0: u32, x1: u32, y: u32, color: Color.Premultiplied) void {
+        const row_start: usize = @as(usize, y) * @as(usize, self.size.x);
+        const start = row_start + x0;
+        const end = row_start + x1;
+        if (color.a == 0xff) {
+            @memset(self.buf[start..end], @bitCast(color));
+        } else for (start..end) |i| {
+            const sample = &self.buf[i];
+            sample.* = sample.*.blend(color);
         }
     }
 
@@ -456,7 +477,7 @@ fn render(
     }
     const drawable: x11.Drawable = if (dbe.backBuffer()) |back_buffer| back_buffer else window.drawable();
 
-    rt.clear(.{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xff });
+    rt.clear(.{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 0xff });
     rt.fillRect(.{
         .x = 100,
         .y = 100,
@@ -469,11 +490,33 @@ fn render(
         .a = 0xff / 4,
     });
 
+    rt.fillRect(.{
+        .x = 100,
+        .y = 0,
+        .width = 50,
+        .height = 50,
+    }, .{
+        .r = 0x00,
+        .g = 0x00,
+        .b = 0xff,
+        .a = 0xff,
+    });
+
     rt.fillCircle(
         .{ .x = 100, .y = 100 },
         50,
-        .{ .r = 0x00, .g = 0x00, .b = 0xff, .a = 0xff },
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0x22 },
     );
+    rt.fillCircle(
+        .{ .x = 200, .y = 100 },
+        50,
+        .{ .r = 0x00, .g = 0xff, .b = 0x00, .a = 0xff },
+    );
+    // rt.fillCircle(
+    //     .{ .x = 0, .y = 100 },
+    //     1000,
+    //     .{ .r = 0x00, .g = 0xff, .b = 0x00, .a = 0xff },
+    // );
 
     try sink.PutImage(.{
         .format = .z_pixmap,
@@ -538,4 +581,5 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const Cmdline = @import("Cmdline.zig");
-const clamp = std.math.clamp;
+const math = std.math;
+const clamp = math.clamp;
