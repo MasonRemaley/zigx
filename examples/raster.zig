@@ -205,13 +205,38 @@ pub const RenderTarget = struct {
             // Figure out the width of this scanline
             const dy = @as(f32, @floatFromInt(y)) - y_mid;
             const dy2 = dy * dy;
-            const radius_x: u32 = @intFromFloat(@ceil(@sqrt(r_sq - dy2)));
+            const radius_x: i64 = @intFromFloat(@ceil(@sqrt(r_sq - dy2)));
             const x_min: i64 = center_x - radius_x + 1;
             const x_max: i64 = center_x + radius_x;
 
+            // XXX: could have an even more braodphase that clips the whole shape
             // XXX: don't go from 0 to radius, start in the non clipped region
+            // XXX: need to do this without overling when negative etc
+            // XXX: make sure above 0
+            // XXX: i think it's something to do with the dist to the elft and right edges as compared to the radius?
+            // we need to set both the upper and lower obunds
+            // XXX: >=/<= vs >/<?
+            // const min_rad_x: usize = if (center.x < 0)
+            //     // @intCast(@min(-center.x, radius_x))
+            //     0
+            // else if (center.x > self.size.x)
+            //     // @intCast(@min(center.x - @as(i64, self.size.x), radius_x))
+            //     0
+            // else
+            //     0;
+            // XXX: CURRENT: miscompilation in x64 backend?? try later zig and then report if it's an issue?
+            // if we set to 0 it works, if we set to 0 like this it fails
+            const min_rad_x: usize = if (center.x < 0) 0 else 0;
+            // const max_rad_x: usize = if (center.x < 0)
+            //     @intCast(@min(-center.x + @as(i64, self.size.x), radius_x))
+            // else if (center.x > self.size.x)
+            //     @intCast(@min(center.x, radius_x))
+            // else
+            //     0;
+
             // Fill in the scanline
-            for (0..radius_x) |i| {
+            // for (min_rad_x..max_rad_x) |i| {
+            for (min_rad_x..@intCast(radius_x)) |i| {
                 // Calculate the left and right x coordinates
                 const left_x: i64 = x_min + @as(u32, @intCast(i));
                 const right_x: i64 = x_max - @as(u32, @intCast(i));
