@@ -28,6 +28,7 @@ const examples = [_]Example{
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_llvm = b.option(bool, "use-llvm", "Overrides default backend selection");
 
     // In almost all cases, Zig programs should only use this module, not the
     // library defined below, that's for C programs.
@@ -58,6 +59,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
+    if (use_llvm) |enabled| examples_exe.use_llvm = enabled;
     const run_examples = b.addRunArtifact(examples_exe);
 
     const test_step = b.step("test", "Run all tests and interactive examples)");
@@ -88,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .name = example.name,
             .root_module = example_mod,
         });
+        if (use_llvm) |enabled| exe.use_llvm = enabled;
 
         const exe_check = b.addExecutable(.{
             .name = b.fmt("{s}_check", .{example.name}),
@@ -143,6 +146,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        if (use_llvm) |enabled| exe.use_llvm = enabled;
         exe.addCSourceFiles(.{
             .files = &.{"c/example/hellox11.c"},
         });
@@ -198,6 +202,7 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
+        if (use_llvm) |enabled| xauth_exe.use_llvm = enabled;
         const install = b.addInstallArtifact(xauth_exe, .{});
         b.step("install-xauth", "").dependOn(&install.step);
         test_non_interactive.dependOn(&install.step);

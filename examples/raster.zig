@@ -1,10 +1,15 @@
-// XXX: get tests running, maybe disable slow tests by default
-// XXX: consider comparing ot preompocuting, need to profile in general
-// XXX: vectorize? bin on threads?
-// XXX: compare to f32 version visually, and benchmark
-// XXX: we could bin this if we need more speed, but i suspect that it will be plenty fast. need to
-// divide into multiple copy areas somehow if we want to test visually but idk if we really can from one
-// buffer. i guess we could just not worry about the visuals for that test.
+// XXX:
+// [ ] get circles right
+//     [ ] make a circle grid (offset to get clipped if needed) to test positions. do they line up vertically correctly?
+//     [ ] make sure 1px circle is on right point
+//     [ ] clipping on > vs >=? +1 in narrow clip?
+// [ ] switch to float inputs?
+// [ ] get tests running, maybe disable slow tests by default
+// [ ] profile, compare to precomputing blends, compare to f32 version
+//     [ ] vectorize/bin?
+
+const timer_period_ns = 16 * std.time.ns_per_ms;
+
 pub const RenderTarget = struct {
     buf: []Color,
     size: XY(u32),
@@ -182,11 +187,15 @@ pub const RenderTarget = struct {
         }
     }
 
-    // XXX: test htat if it's 1px wide it actually is on the righ tpixel
-    // XXX: profile blend operating on a pointer vs not?
-    // XXX: i think we could step avoiding all sqrts using one of those algorithsm then continue with
-    // the scanline fill mirroring, but, probably overkill if it's complex?
     pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u32, color: Color) void {
+        // Clip the circle if it's fully offscreen
+        if (-center.x > radius or
+            center.x > self.size.x + radius or
+            -center.y > radius or
+            center.y > self.size.y + radius)
+        {
+            return;
+        }
         // Precompute values we'll use in the hot loop
         const center_x: i64 = center.x;
         const r: f32 = @floatFromInt(radius);
@@ -209,34 +218,12 @@ pub const RenderTarget = struct {
             const x_min: i64 = center_x - radius_x + 1;
             const x_max: i64 = center_x + radius_x;
 
-            // XXX: could have an even more braodphase that clips the whole shape
-            // XXX: don't go from 0 to radius, start in the non clipped region
-            // XXX: need to do this without overling when negative etc
-            // XXX: make sure above 0
-            // XXX: i think it's something to do with the dist to the elft and right edges as compared to the radius?
-            // we need to set both the upper and lower obunds
-            // XXX: >=/<= vs >/<?
-            // const min_rad_x: usize = if (center.x < 0)
-            //     // @intCast(@min(-center.x, radius_x))
-            //     0
-            // else if (center.x > self.size.x)
-            //     // @intCast(@min(center.x - @as(i64, self.size.x), radius_x))
-            //     0
-            // else
-            //     0;
-            // XXX: CURRENT: miscompilation in x64 backend?? try later zig and then report if it's an issue?
-            // if we set to 0 it works, if we set to 0 like this it fails
-            const min_rad_x: usize = if (center.x < 0) 0 else 0;
-            // const max_rad_x: usize = if (center.x < 0)
-            //     @intCast(@min(-center.x + @as(i64, self.size.x), radius_x))
-            // else if (center.x > self.size.x)
-            //     @intCast(@min(center.x, radius_x))
-            // else
-            //     0;
-
             // Fill in the scanline
-            // for (min_rad_x..max_rad_x) |i| {
-            for (min_rad_x..@intCast(radius_x)) |i| {
+            //
+            // Avoiding range based for loop here due to this issue. If resolving, keep in mind that
+            // the min value can be over the max when clipped.
+            // https://codeberg.org/ziglang/zig/issues/31133
+            for (0..@intCast(radius_x)) |i| {
                 // Calculate the left and right x coordinates
                 const left_x: i64 = x_min + @as(u32, @intCast(i));
                 const right_x: i64 = x_max - @as(u32, @intCast(i));
@@ -257,7 +244,6 @@ pub const RenderTarget = struct {
                 // the rest of the scanline at full opacity.
                 if (coverage == 1) {
                     // Clip the left and right sides of the flood fill
-                    // XXX: clip correctly, check this math not sure why +1 for example
                     const fill_left_unclamped = @as(i64, left_x);
                     const fill_right_unclamped = @as(i64, @intCast(x_max)) + 1 - @as(i64, @intCast(i));
                     const fill_left: u32 = @intCast(clamp(fill_left_unclamped, 0, self.size.x));
@@ -423,60 +409,190 @@ pub fn main() !void {
     const raster_gc = ids.rasterGc();
     try sink.CreateGc(raster_gc, raster_pixmap.drawable(), .{});
 
-    while (true) {
-        try sink.writer.flush();
-        const msg_kind = source.readKind() catch |err| return switch (err) {
-            error.EndOfStream => {
-                std.log.info("X11 connection closed (EndOfStream)", .{});
-                std.process.exit(0);
-            },
-            else => |e| switch (socket_reader.getError() orelse e) {
-                error.ConnectionResetByPeer => {
-                    std.log.info("X11 connection closed (ConnectionReset)", .{});
-                    return std.process.exit(0);
-                },
-                else => |e2| e2,
-            },
-        };
+    var entity_buf: [16]Entity = undefined;
+    var entities: std.ArrayList(Entity) = .initBuffer(&entity_buf);
+    try entities.appendBounded(.{
+        .shape = .{ .rect = .{
+            .x = 0,
+            .y = 0,
+            .width = 100,
+            .height = 100,
+        } },
+        .origin = .{ .x = 0, .y = 0 },
+        .velocity = .{ .x = 2, .y = 1 },
+        .color = .{ .r = 0xff, .g = 0xaa, .b = 0x22, .a = 0xaa },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .rect = .{
+            .x = 100,
+            .y = 50,
+            .width = 100,
+            .height = 100,
+        } },
+        .origin = .{ .x = 0, .y = 0 },
+        .velocity = .{ .x = 3, .y = 4 },
+        .color = .{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xee },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .rect = .{
+            .x = 100,
+            .y = 50,
+            .width = 50,
+            .height = 100,
+        } },
+        .origin = .{ .x = 0, .y = 0 },
+        .velocity = .{ .x = 2, .y = 4 },
+        .color = .{ .r = 0xff, .g = 0xaa, .b = 0xaa, .a = 0xaa },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .circle = .{ .radius = 50 } },
+        .origin = .{ .x = 10, .y = 10 },
+        .velocity = .{ .x = -4, .y = 0 },
+        .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .circle = .{ .radius = 25 } },
+        .origin = .{ .x = 20, .y = 10 },
+        .velocity = .{ .x = 4, .y = -2 },
+        .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .circle = .{ .radius = 30 } },
+        .origin = .{ .x = 100, .y = 20 },
+        .velocity = .{ .x = 3, .y = 2 },
+        .color = .{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa },
+    });
 
-        var do_render = false;
-        switch (msg_kind) {
-            .Expose => {
-                const expose = try source.read2(.Expose);
-                std.log.info("X11 {}", .{expose});
-                do_render = true;
-            },
-            .ConfigureNotify => {
-                const msg = try source.read2(.ConfigureNotify);
-                std.debug.assert(msg.event == ids.window());
-                std.debug.assert(msg.window == ids.window());
-                if (window_size.x != msg.width or window_size.y != msg.height) {
-                    std.log.info("WindowSize {}x{}", .{ msg.width, msg.height });
-                    window_size = .{ .x = msg.width, .y = msg.height };
-                    do_render = true;
-                }
-            },
-            .MapNotify,
-            .MotionNotify,
-            .MappingNotify,
-            .ReparentNotify,
-            => try source.discardRemaining(),
-            else => std.debug.panic("unexpected X11 {f}", .{source.readFmt()}),
+    var timer: std.time.Timer = try .start();
+    while (true) {
+        // Poll for events
+        while (socket_reader.interface().bufferedLen() > 0) {
+            try sink.writer.flush();
+            const msg_kind = source.readKind() catch |err| return switch (err) {
+                error.EndOfStream => {
+                    std.log.info("X11 connection closed (EndOfStream)", .{});
+                    std.process.exit(0);
+                },
+                else => |e| switch (socket_reader.getError() orelse e) {
+                    error.ConnectionResetByPeer => {
+                        std.log.info("X11 connection closed (ConnectionReset)", .{});
+                        return std.process.exit(0);
+                    },
+                    else => |e2| e2,
+                },
+            };
+
+            switch (msg_kind) {
+                .Expose => {
+                    const expose = try source.read2(.Expose);
+                    std.log.info("X11 {}", .{expose});
+                },
+                .ConfigureNotify => {
+                    const msg = try source.read2(.ConfigureNotify);
+                    std.debug.assert(msg.event == ids.window());
+                    std.debug.assert(msg.window == ids.window());
+                    if (window_size.x != msg.width or window_size.y != msg.height) {
+                        std.log.info("WindowSize {}x{}", .{ msg.width, msg.height });
+                        window_size = .{ .x = msg.width, .y = msg.height };
+                    }
+                },
+                .MapNotify,
+                .MotionNotify,
+                .MappingNotify,
+                .ReparentNotify,
+                => try source.discardRemaining(),
+                else => std.debug.panic("unexpected X11 {f}", .{source.readFmt()}),
+            }
         }
-        if (do_render) {
-            try render(
-                &sink,
-                ids,
-                dbe,
-                window_size,
-                rt,
-            );
+
+        // Update
+        for (entities.items) |*entity| entity.update(window_size);
+
+        // Render
+        try render(
+            &sink,
+            ids,
+            dbe,
+            window_size,
+            rt,
+            entities.items,
+        );
+
+        // Sleep
+        while (true) {
+            const elapsed = timer.read();
+            if (elapsed > timer_period_ns) break;
         }
+        timer.reset();
     }
 
     try sink.FreePixmap(raster_pixmap);
     try sink.FreeGc(ids.raster_gc);
 }
+
+const Entity = struct {
+    const Shape = union(enum) {
+        rect: x11.Rectangle,
+        circle: struct { radius: u32 },
+    };
+    shape: Shape,
+    color: RenderTarget.Color,
+    origin: x11.XY(i16),
+    velocity: x11.XY(i16),
+
+    pub fn getAabb(self: @This()) x11.Rectangle {
+        switch (self.shape) {
+            .rect => |rect| return .{
+                .x = self.origin.x + rect.x,
+                .y = self.origin.y + rect.y,
+                .width = rect.width,
+                .height = rect.height,
+            },
+            // XXX: why do they not quite touch vertically?
+            .circle => |circle| return .{
+                .x = self.origin.x - @as(i16, @intCast(circle.radius)),
+                .y = self.origin.y - @as(i16, @intCast(circle.radius)),
+                .width = @as(u16, @intCast(circle.radius)) * 2,
+                .height = @as(u16, @intCast(circle.radius)) * 2,
+            },
+        }
+    }
+
+    pub fn update(self: *@This(), window_size: x11.XY(u16)) void {
+        const bounce_margin = 50;
+
+        self.origin.x += self.velocity.x;
+        self.origin.y += self.velocity.y;
+
+        const aabb = self.getAabb();
+
+        if (aabb.x - bounce_margin > window_size.x) {
+            self.velocity.x = -@as(i16, @intCast(@abs(self.velocity.x)));
+        } else if (aabb.x + @as(i16, @intCast(aabb.width)) + bounce_margin < 0) {
+            self.velocity.x = @intCast(@abs(self.velocity.x));
+        }
+
+        if (aabb.y - bounce_margin > window_size.y) {
+            self.velocity.y = -@as(i16, @intCast(@abs(self.velocity.y)));
+        } else if (aabb.y + @as(i16, @intCast(aabb.height)) + bounce_margin < 0) {
+            self.velocity.y = @intCast(@abs(self.velocity.y));
+        }
+    }
+
+    pub fn render(self: *const @This(), rt: RenderTarget) void {
+        switch (self.shape) {
+            .rect => rt.fillRect(
+                self.getAabb(),
+                self.color,
+            ),
+            .circle => |circle| rt.fillCircle(
+                self.origin,
+                circle.radius,
+                self.color,
+            ),
+        }
+    }
+};
 
 fn render(
     sink: *x11.RequestSink,
@@ -484,6 +600,7 @@ fn render(
     dbe: Dbe,
     window_size: XY(u16),
     rt: RenderTarget,
+    entities: []const Entity,
 ) !void {
     const window = ids.window();
     const gc = ids.gc();
@@ -503,45 +620,35 @@ fn render(
     const drawable: x11.Drawable = if (dbe.backBuffer()) |back_buffer| back_buffer else window.drawable();
 
     rt.clear(.{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 0xff });
-    rt.fillRect(.{
-        .x = 100,
-        .y = 100,
-        .width = 10,
-        .height = 100,
-    }, .{
-        .r = 0x00,
-        .g = 0x00,
-        .b = 0xff,
-        .a = 0xff / 4,
-    });
 
-    rt.fillRect(.{
-        .x = 100,
-        .y = 0,
-        .width = 50,
-        .height = 50,
-    }, .{
-        .r = 0x00,
-        .g = 0x00,
-        .b = 0xff,
-        .a = 0xff,
-    });
+    // Render a grid background
+    {
+        const cell_size = 10;
+        var row: i16 = 0;
+        while (row <= window_size.x / cell_size) : (row += 1) {
+            const y = row * cell_size;
+            var col: i16 = 0;
+            while (col <= window_size.y / cell_size) : (col += 1) {
+                const x = col * cell_size * 2 + cell_size * @mod(row, 2);
+                rt.fillRect(
+                    .{
+                        .x = x,
+                        .y = y,
+                        .width = cell_size,
+                        .height = cell_size,
+                    },
+                    .{
+                        .r = 0x00,
+                        .g = 0x00,
+                        .b = 0x00,
+                        .a = 0x40,
+                    },
+                );
+            }
+        }
+    }
 
-    rt.fillCircle(
-        .{ .x = 100, .y = 100 },
-        50,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0x22 },
-    );
-    rt.fillCircle(
-        .{ .x = 200, .y = 100 },
-        50,
-        .{ .r = 0x00, .g = 0xff, .b = 0x00, .a = 0xff },
-    );
-    // rt.fillCircle(
-    //     .{ .x = 0, .y = 100 },
-    //     1000,
-    //     .{ .r = 0x00, .g = 0xff, .b = 0x00, .a = 0xff },
-    // );
+    for (entities) |entity| entity.render(rt);
 
     try sink.PutImage(.{
         .format = .z_pixmap,
