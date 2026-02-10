@@ -574,6 +574,32 @@ pub fn main() !void {
         .velocity = .{ .x = 3, .y = 2 },
         .color = .{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa },
     });
+    const line_radius = 10;
+    try entities.appendBounded(.{
+        .shape = .{ .line_end = .{ .radius = line_radius } },
+        .origin = .{ .x = 50, .y = 50 },
+        .velocity = .{ .x = 2, .y = 3 },
+        .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .line_end = .{ .radius = line_radius } },
+        .origin = .{ .x = 100, .y = 40 },
+        .velocity = .{ .x = 3, .y = 2 },
+        .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
+    });
+    const line_radius2 = 5;
+    try entities.appendBounded(.{
+        .shape = .{ .line_end = .{ .radius = line_radius2 } },
+        .origin = .{ .x = 25, .y = 50 },
+        .velocity = .{ .x = 4, .y = 3 },
+        .color = .{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .line_end = .{ .radius = line_radius2 } },
+        .origin = .{ .x = 100, .y = 80 },
+        .velocity = .{ .x = -3, .y = -3 },
+        .color = .{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa },
+    });
 
     var timer: std.time.Timer = try .start();
     while (true) {
@@ -618,7 +644,7 @@ pub fn main() !void {
         }
 
         // Update
-        for (entities.items) |*entity| entity.update(window_size);
+        Entity.update(entities.items, window_size);
 
         // Render
         try render(
@@ -646,61 +672,92 @@ const Entity = struct {
     const Shape = union(enum) {
         rect: x11.Rectangle,
         circle: struct { radius: u32 },
+        /// Must be followed by the other end.
+        line_end: struct { radius: u8 },
     };
     shape: Shape,
     color: RenderTarget.Color,
     origin: x11.XY(i16),
     velocity: x11.XY(i16),
 
-    pub fn getAabb(self: @This()) x11.Rectangle {
-        switch (self.shape) {
+    pub fn getAabb(entities: []const @This(), index: usize) x11.Rectangle {
+        const entity = entities[index];
+        switch (entity.shape) {
             .rect => |rect| return .{
-                .x = self.origin.x + rect.x,
-                .y = self.origin.y + rect.y,
+                .x = entity.origin.x + rect.x,
+                .y = entity.origin.y + rect.y,
                 .width = rect.width,
                 .height = rect.height,
             },
             .circle => |circle| return .{
-                .x = self.origin.x - @as(i16, @intCast(circle.radius)),
-                .y = self.origin.y - @as(i16, @intCast(circle.radius)),
+                .x = entity.origin.x - @as(i16, @intCast(circle.radius)),
+                .y = entity.origin.y - @as(i16, @intCast(circle.radius)),
                 .width = @as(u16, @intCast(circle.radius)) * 2,
                 .height = @as(u16, @intCast(circle.radius)) * 2,
+            },
+            .line_end => |line_end| {
+                const rn = -@as(i16, line_end.radius);
+                const r2 = @as(u16, line_end.radius) * 2;
+                return .{
+                    .x = entity.origin.x + rn,
+                    .y = entity.origin.y + rn,
+                    .width = r2,
+                    .height = r2,
+                };
             },
         }
     }
 
-    pub fn update(self: *@This(), window_size: x11.XY(u16)) void {
-        const bounce_margin = 50;
+    pub fn update(entities: []@This(), window_size: x11.XY(u16)) void {
+        for (entities, 0..) |*entity, i| {
+            const bounce_margin = 50;
 
-        self.origin.x += self.velocity.x;
-        self.origin.y += self.velocity.y;
+            entity.origin.x += entity.velocity.x;
+            entity.origin.y += entity.velocity.y;
 
-        const aabb = self.getAabb();
+            const aabb = getAabb(entities, i);
 
-        if (aabb.x - bounce_margin > window_size.x) {
-            self.velocity.x = -@as(i16, @intCast(@abs(self.velocity.x)));
-        } else if (aabb.x + @as(i16, @intCast(aabb.width)) + bounce_margin < 0) {
-            self.velocity.x = @intCast(@abs(self.velocity.x));
-        }
+            if (aabb.x - bounce_margin > window_size.x) {
+                entity.velocity.x = -@as(i16, @intCast(@abs(entity.velocity.x)));
+            } else if (aabb.x + @as(i16, @intCast(aabb.width)) + bounce_margin < 0) {
+                entity.velocity.x = @intCast(@abs(entity.velocity.x));
+            }
 
-        if (aabb.y - bounce_margin > window_size.y) {
-            self.velocity.y = -@as(i16, @intCast(@abs(self.velocity.y)));
-        } else if (aabb.y + @as(i16, @intCast(aabb.height)) + bounce_margin < 0) {
-            self.velocity.y = @intCast(@abs(self.velocity.y));
+            if (aabb.y - bounce_margin > window_size.y) {
+                entity.velocity.y = -@as(i16, @intCast(@abs(entity.velocity.y)));
+            } else if (aabb.y + @as(i16, @intCast(aabb.height)) + bounce_margin < 0) {
+                entity.velocity.y = @intCast(@abs(entity.velocity.y));
+            }
         }
     }
 
-    pub fn render(self: *const @This(), rt: RenderTarget) void {
-        switch (self.shape) {
-            .rect => rt.fillRect(
-                self.getAabb(),
-                self.color,
-            ),
-            .circle => |circle| rt.fillCircle(
-                self.origin,
-                circle.radius,
-                self.color,
-            ),
+    pub fn render(entities: []const @This(), rt: RenderTarget) void {
+        var i: usize = 0;
+        while (i < entities.len) : (i += 1) {
+            const entity = entities[i];
+            switch (entity.shape) {
+                .rect => rt.fillRect(
+                    getAabb(entities, i),
+                    entity.color,
+                ),
+                .circle => |circle| rt.fillCircle(
+                    entity.origin,
+                    circle.radius,
+                    entity.color,
+                ),
+                .line_end => |shape| {
+                    if (i + 1 >= entities.len) continue;
+                    const other = entities[i + 1];
+                    if (other.shape != .line_end) continue;
+                    rt.drawLine(
+                        entity.origin,
+                        other.origin,
+                        shape.radius,
+                        entity.color,
+                    );
+                    i += 1;
+                },
+            }
         }
     }
 };
@@ -759,14 +816,7 @@ fn render(
         }
     }
 
-    for (entities) |entity| entity.render(rt);
-    // XXX: make entity for this
-    rt.drawLine(
-        .{ .x = 0, .y = 0 },
-        .{ .x = 100, .y = 100 },
-        10,
-        .{ .r = 0, .g = 0, .b = 0, .a = 0xff },
-    );
+    Entity.render(entities, rt);
 
     try sink.PutImage(.{
         .format = .z_pixmap,
