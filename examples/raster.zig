@@ -1,11 +1,15 @@
 // XXX:
+// [x] rects
+//     [ ] switch to extents
 // [x] get circles right
 //     [ ] make sure 1px circle is on right point
 //     [ ] clipping on > vs >=? +1 in narrow clip?
 //         [ ] related to why adjacent circles touch horizontally but not vertically?
+//     [ ] lines and circles are offset slightly on stick figure
 // [x] lines
 //     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
-// [ ] switch to float inputs?
+// [x] image
+// [ ] switch to float inputs? if not clean up integer types
 // [ ] get tests running, maybe disable slow tests by default
 // [ ] profile, compare to precomputing blends, compare to f32 version
 //     [ ] vectorize/bin?
@@ -13,8 +17,8 @@
 
 const timer_period_ns = 16 * std.time.ns_per_ms;
 
-pub const RenderTarget = struct {
-    buf: []Color,
+pub const Image = struct {
+    buf: []Color.Premultiplied,
     size: XY(u32),
 
     const Color = packed struct(u32) {
@@ -28,56 +32,102 @@ pub const RenderTarget = struct {
             g: u8,
             r: u8,
             a: u8,
-        };
 
-        /// Efficiently blends source onto destination, emulating the alpha blending you'd get from
-        /// alpha blending on a GPU. When possible, cache the premultiplied source outside of your hot
-        /// loop.
-        ///
-        /// Note: This method is intended for real time use. If you can afford a more expensive blend
-        /// or are building a tool that will be used by artists, you should not be calling this method,
-        /// you should be blending in a perceptual space like Oklab or at least doing sRGB correction
-        /// before you call this method.
-        pub fn blend(dst: Color, src_premul: Premultiplied) Color {
-            const dst_scaled = dst.scale(0xff - src_premul.a);
-            return .{
-                .r = src_premul.r + dst_scaled.r,
-                .g = src_premul.g + dst_scaled.g,
-                .b = src_premul.b + dst_scaled.b,
-                .a = src_premul.a + dst_scaled.a,
-            };
-        }
+            /// Efficiently blends source onto destination, emulating the alpha blending you'd get
+            /// from alpha blending on a GPU. For best performance, you should cache the
+            /// premultiplied source outside of your hot loop or bake it into your data.
+            ///
+            /// Note: This method is intended for real time use. If you can afford a more expensive
+            /// blend or are building a tool that will be used by artists, you should not be calling
+            /// this method, you should be blending in a perceptual space like Oklab or at least
+            /// doing sRGB correction before you call this method.
+            pub fn blend(dst: @This(), src: @This()) @This() {
+                const dst_scaled = dst.scale(0xff - src.a);
+                return .{
+                    .r = src.r + dst_scaled.r,
+                    .g = src.g + dst_scaled.g,
+                    .b = src.b + dst_scaled.b,
+                    .a = src.a + dst_scaled.a,
+                };
+            }
+
+            /// Similar to `blend`, but opitmized to skip blending if the source is opaque. `blend`
+            /// elides this optimization because it can often be done at a higher level, e.g. before
+            /// rendering an entire scanline.
+            pub fn blendOrBlit(dst: @This(), src: @This()) @This() {
+                if (src.a == 0xff) return src;
+                return dst.blend(src);
+            }
+
+            /// Efficiently scales all channels by the given unorm factor.
+            ///
+            /// Adapted from "Alpha Blending with No Division Operations" by Jerry R. Van Aken:
+            ///
+            /// https://arxiv.org/pdf/2202.02864
+            pub fn scale(self: @This(), factor: u8) @This() {
+                comptime assert(builtin.cpu.arch.endian() == .little);
+
+                if (factor == 0xff) return self;
+
+                const bgra: u32 = @bitCast(self);
+
+                var br = bgra & 0x00ff00ff;
+                br *= factor;
+                br += 0x00800080;
+                br += (br >> 8) & 0x00ff00ff;
+                br &= 0xff00ff00;
+
+                var ga = (bgra >> 8) & 0x00ff00ff;
+                ga *= factor;
+                ga += 0x00800080;
+                ga += (ga >> 8) & 0x00ff00ff;
+                ga &= 0xff00ff00;
+
+                return @bitCast(ga | (br >> 8));
+            }
+
+            /// Simple but slow implementation of `scale` for tests.
+            fn scaleF32(color: Color, factor: u8) Color {
+                return .{
+                    .r = unormTimesUnormF32(factor, color.r),
+                    .g = unormTimesUnormF32(factor, color.g),
+                    .b = unormTimesUnormF32(factor, color.b),
+                    .a = unormTimesUnormF32(factor, color.a),
+                };
+            }
+
+            test scale {
+                // The premul test is already pretty exhaustive, we just need to check a few cases where we
+                // are also scaling the alpha channel. Since there's an extra level of nesting here we
+                // don't want to check every single value.
+                for (0..5) |r| {
+                    const r8: u8 = @intCast(r * 255 / 4);
+                    for (0..5) |g| {
+                        const g8: u8 = @intCast(g * 255 / 4);
+                        for (0..5) |b| {
+                            const b8: u8 = @intCast(b * 255 / 4);
+                            for (0..5) |a| {
+                                const a8: u8 = @intCast(a * 255 / 4);
+                                for (0..5) |f| {
+                                    const f8: u8 = @intCast(f * 255 / 4);
+                                    const c: Color = .{ .r = r8, .g = g8, .b = b8, .a = a8 };
+                                    try std.testing.expectEqual(
+                                        c.scaleF32(f8),
+                                        c.scale(f8),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
         /// Efficiently scales the color channels by the alpha channel.
         pub fn premul(self: Color) Premultiplied {
-            if (self.a == 0xff) return @bitCast(self);
-            var bgr = self;
-            bgr.a = 0xff;
-            return @bitCast(bgr.scale(self.a));
-        }
-
-        /// Efficiently scales all channels by the given unorm factor.
-        ///
-        /// Adapted from "Alpha Blending with No Division Operations" by Jerry R. Van Aken:
-        ///
-        /// https://arxiv.org/pdf/2202.02864
-        pub fn scale(self: Color, factor: u8) Color {
-            comptime assert(builtin.cpu.arch.endian() == .little);
-            const bgra: u32 = @bitCast(self);
-
-            var br = bgra & 0x00ff00ff;
-            br *= factor;
-            br += 0x00800080;
-            br += (br >> 8) & 0x00ff00ff;
-            br &= 0xff00ff00;
-
-            var ga = (bgra >> 8) & 0x00ff00ff;
-            ga *= factor;
-            ga += 0x00800080;
-            ga += (ga >> 8) & 0x00ff00ff;
-            ga &= 0xff00ff00;
-
-            return @bitCast(ga | (br >> 8));
+            var result: Color.Premultiplied = @bitCast(self);
+            result.a = 0xff;
+            return result.scale(self.a);
         }
 
         /// Equivalent to `premul`, but internally computes the result using floating point. This is
@@ -86,23 +136,6 @@ pub const RenderTarget = struct {
             var bgr = self;
             bgr.a = 0xff;
             return @bitCast(bgr.scaleF32(self.a));
-        }
-
-        fn scaleF32(color: Color, factor: u8) Color {
-            return .{
-                .r = unormTimesUnormF32(factor, color.r),
-                .g = unormTimesUnormF32(factor, color.g),
-                .b = unormTimesUnormF32(factor, color.b),
-                .a = unormTimesUnormF32(factor, color.a),
-            };
-        }
-
-        /// Multiplies two unorms by temporarily converting to f32. This is slow, used only as a test
-        /// oracle.
-        fn unormTimesUnormF32(alpha: u8, red: u8) u8 {
-            const a: f32 = @floatFromInt(alpha);
-            const r: f32 = @floatFromInt(red);
-            return @intFromFloat(@round((a * r) / 255));
         }
 
         test premul {
@@ -126,33 +159,15 @@ pub const RenderTarget = struct {
                 }
             }
         }
-
-        test scale {
-            // The premul test is already pretty exhaustive, we just need to check a few cases where we
-            // are also scaling the alpha channel. Since there's an extra level of nesting here we
-            // don't want to check every single value.
-            for (0..5) |r| {
-                const r8: u8 = @intCast(r * 255 / 4);
-                for (0..5) |g| {
-                    const g8: u8 = @intCast(g * 255 / 4);
-                    for (0..5) |b| {
-                        const b8: u8 = @intCast(b * 255 / 4);
-                        for (0..5) |a| {
-                            const a8: u8 = @intCast(a * 255 / 4);
-                            for (0..5) |f| {
-                                const f8: u8 = @intCast(f * 255 / 4);
-                                const c: Color = .{ .r = r8, .g = g8, .b = b8, .a = a8 };
-                                try std.testing.expectEqual(
-                                    c.scaleF32(f8),
-                                    c.scale(f8),
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
     };
+
+    /// Multiplies two unorms by temporarily converting to f32. This is slow, used only as a test
+    /// oracle.
+    fn unormTimesUnormF32(alpha: u8, red: u8) u8 {
+        const a: f32 = @floatFromInt(alpha);
+        const r: f32 = @floatFromInt(red);
+        return @intFromFloat(@round((a * r) / 255));
+    }
 
     test {
         _ = Color;
@@ -160,7 +175,7 @@ pub const RenderTarget = struct {
 
     pub fn init(gpa: Allocator, size: XY(u32)) !@This() {
         return .{
-            .buf = try gpa.alloc(Color, @as(usize, size.x) * @as(usize, size.y)),
+            .buf = try gpa.alloc(Color.Premultiplied, @as(usize, size.x) * @as(usize, size.y)),
             .size = size,
         };
     }
@@ -170,7 +185,7 @@ pub const RenderTarget = struct {
         self.* = undefined;
     }
 
-    pub fn clear(self: @This(), color: Color) void {
+    pub fn clear(self: @This(), color: Color.Premultiplied) void {
         @memset(self.buf, color);
     }
 
@@ -264,6 +279,7 @@ pub const RenderTarget = struct {
                 });
 
                 // Blend with the render target. The casts are safe when not clipped.
+                // cache row start?
                 const row_index = self.size.x * y;
                 if (!left_clipped) {
                     const sample = &self.buf[row_index + @as(usize, @intCast(left_x))];
@@ -319,6 +335,8 @@ pub const RenderTarget = struct {
             const pa_y = y - a_y;
             const pa_ba_y = pa_y * ba_y;
 
+            const row_start = self.size.x * y_i;
+
             for (min.x..max.x) |x_i| {
                 const x: f32 = @floatFromInt(x_i);
 
@@ -340,12 +358,8 @@ pub const RenderTarget = struct {
                 // If we're fully inside the shape, blit or alpha blend the color and early out to
                 // avoid the square root
                 if (sd2 < r_early_in2) {
-                    const sample = &self.buf[self.size.x * y_i + x_i];
-                    if (color.a == 0xff) {
-                        sample.* = color;
-                    } else {
-                        sample.* = sample.blend(color_p);
-                    }
+                    const sample = &self.buf[row_start + x_i];
+                    sample.* = sample.blendOrBlit(color_p);
                     continue;
                 }
 
@@ -353,10 +367,34 @@ pub const RenderTarget = struct {
                 // get correct antialiasing
                 const sd = @sqrt(sd2) - r;
                 self.fillSdf(
-                    .{ .x = @intCast(x_i), .y = @intCast(y_i) },
+                    row_start + x_i,
                     sd,
                     color_p,
                 );
+            }
+        }
+    }
+
+    fn drawImage(self: @This(), origin: x11.XY(i16), image: @This(), opacity: u8) void {
+        const min_dst: x11.XY(u32) = .{
+            .x = clamp(origin.x, 0, self.size.x),
+            .y = clamp(origin.y, 0, self.size.y),
+        };
+        const max_dst: x11.XY(u32) = .{
+            .x = @intCast(clamp(origin.x + @as(i64, image.size.x), 0, self.size.x)),
+            .y = @intCast(clamp(origin.y + @as(i64, image.size.x), 0, self.size.y)),
+        };
+        const min_src: x11.XY(u32) = .{
+            .x = @intCast(@max(0, -@as(i64, origin.x))),
+            .y = @intCast(@max(0, -@as(i64, origin.y))),
+        };
+        for (min_dst.y..max_dst.y, min_src.y..) |dst_y, src_y| {
+            const dst_row_start = self.size.x * dst_y;
+            const src_row_start = image.size.x * src_y;
+            for (min_dst.x..max_dst.x, min_src.x..) |dst_x, src_x| {
+                const dst = &self.buf[dst_row_start + dst_x];
+                const src = image.buf[src_row_start + src_x];
+                dst.* = dst.blendOrBlit(src.scale(opacity));
             }
         }
     }
@@ -368,32 +406,27 @@ pub const RenderTarget = struct {
         const start = row_start + x0;
         const end = row_start + x1;
         if (color.a == 0xff) {
-            @memset(self.buf[start..end], @bitCast(color));
+            @memset(self.buf[start..end], color);
         } else for (start..end) |i| {
             const sample = &self.buf[i];
             sample.* = sample.*.blend(color);
         }
     }
 
-    fn fillSdf(self: @This(), p: x11.XY(u16), sd: f32, color: Color.Premultiplied) void {
+    fn fillSdf(self: @This(), index: usize, sd: f32, color: Color.Premultiplied) void {
         // If we're fully outside the shape, early out. Otherwise get the sample.
         if (sd > 0.5) return;
-        const sample = &self.buf[self.size.x * p.y + p.x];
+        const sample = &self.buf[index];
 
         // If we're fully inside the shape, blit or alpha blend the premul color.
         if (sd < -0.5) {
-            if (color.a == 0xff) {
-                sample.* = @bitCast(color);
-            } else {
-                sample.* = sample.*.blend(color);
-            }
+            sample.* = sample.blendOrBlit(color);
             return;
         }
 
         // Apply antialiasing
         const a = floatToUnorm(0.5 - sd);
-        const color_aa: Color = .scale(@bitCast(color), a);
-        sample.* = sample.*.blend(@bitCast(color_aa));
+        sample.* = sample.*.blend(color.scale(a));
     }
 
     fn floatToUnorm(f: f32) u8 {
@@ -506,7 +539,7 @@ pub fn main() !void {
 
     try sink.MapWindow(ids.window());
 
-    var rt: RenderTarget = try .init(std.heap.page_allocator, .{
+    var rt: Image = try .init(std.heap.page_allocator, .{
         .x = @intCast(window_size.x),
         .y = @intCast(window_size.y),
     });
@@ -521,84 +554,153 @@ pub fn main() !void {
     const raster_gc = ids.rasterGc();
     try sink.CreateGc(raster_gc, raster_pixmap.drawable(), .{});
 
+    var sprite: Image = try .init(std.heap.page_allocator, .{
+        .x = 64,
+        .y = 64,
+    });
+    defer sprite.deinit(std.heap.page_allocator);
+    sprite.clear(.{
+        .r = 0x00,
+        .g = 0x00,
+        .b = 0x00,
+        .a = 0x0,
+    });
+    sprite.fillCircle(
+        .{ .x = 32, .y = 10 },
+        10,
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+    );
+    sprite.drawLine(
+        .{ .x = 32, .y = 10 },
+        .{ .x = 32, .y = 40 },
+        2,
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+    );
+    sprite.drawLine(
+        .{ .x = 20, .y = 59 },
+        .{ .x = 32, .y = 40 },
+        2,
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+    );
+    sprite.drawLine(
+        .{ .x = 64 - 20, .y = 59 },
+        .{ .x = 32, .y = 40 },
+        2,
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+    );
+    sprite.drawLine(
+        .{ .x = 20, .y = 35 },
+        .{ .x = 32, .y = 20 },
+        2,
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+    );
+    sprite.drawLine(
+        .{ .x = 64 - 20, .y = 35 },
+        .{ .x = 32, .y = 20 },
+        2,
+        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+    );
+
     var entity_buf: [16]Entity = undefined;
     var entities: std.ArrayList(Entity) = .initBuffer(&entity_buf);
     try entities.appendBounded(.{
         .shape = .{ .rect = .{
-            .x = 0,
-            .y = 0,
-            .width = 100,
-            .height = 100,
+            .extent = .{
+                .x = 0,
+                .y = 0,
+                .width = 100,
+                .height = 100,
+            },
+            .color = .{ .r = 0xff, .g = 0xaa, .b = 0x22, .a = 0xaa },
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 2, .y = 1 },
-        .color = .{ .r = 0xff, .g = 0xaa, .b = 0x22, .a = 0xaa },
     });
     try entities.appendBounded(.{
         .shape = .{ .rect = .{
-            .x = 100,
-            .y = 50,
-            .width = 100,
-            .height = 100,
+            .extent = .{
+                .x = 100,
+                .y = 50,
+                .width = 100,
+                .height = 100,
+            },
+            .color = .{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xee },
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 3, .y = 4 },
-        .color = .{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xee },
     });
     try entities.appendBounded(.{
         .shape = .{ .rect = .{
-            .x = 100,
-            .y = 50,
-            .width = 50,
-            .height = 100,
+            .extent = .{
+                .x = 100,
+                .y = 50,
+                .width = 50,
+                .height = 100,
+            },
+            .color = .{ .r = 0xff, .g = 0xaa, .b = 0xaa, .a = 0xaa },
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 2, .y = 4 },
-        .color = .{ .r = 0xff, .g = 0xaa, .b = 0xaa, .a = 0xaa },
     });
     try entities.appendBounded(.{
-        .shape = .{ .circle = .{ .radius = 50 } },
+        .shape = .{ .circle = .{
+            .radius = 50,
+            .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
+        } },
         .origin = .{ .x = 10, .y = 10 },
         .velocity = .{ .x = -4, .y = 0 },
-        .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
     });
     try entities.appendBounded(.{
-        .shape = .{ .circle = .{ .radius = 25 } },
+        .shape = .{ .circle = .{
+            .radius = 25,
+            .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
+        } },
         .origin = .{ .x = 20, .y = 10 },
         .velocity = .{ .x = 4, .y = -2 },
-        .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
     });
     try entities.appendBounded(.{
-        .shape = .{ .circle = .{ .radius = 30 } },
+        .shape = .{ .circle = .{
+            .radius = 30,
+            .color = .{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa },
+        } },
         .origin = .{ .x = 100, .y = 20 },
         .velocity = .{ .x = 3, .y = 2 },
-        .color = .{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa },
     });
-    const line_radius = 10;
     try entities.appendBounded(.{
-        .shape = .{ .line_end = .{ .radius = line_radius } },
+        .shape = .{ .line_start = .{
+            .radius = 10,
+            .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
+        } },
         .origin = .{ .x = 50, .y = 50 },
         .velocity = .{ .x = 2, .y = 3 },
-        .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
     });
     try entities.appendBounded(.{
-        .shape = .{ .line_end = .{ .radius = line_radius } },
+        .shape = .line_end,
         .origin = .{ .x = 100, .y = 40 },
         .velocity = .{ .x = 3, .y = 2 },
-        .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
     });
-    const line_radius2 = 5;
     try entities.appendBounded(.{
-        .shape = .{ .line_end = .{ .radius = line_radius2 } },
+        .shape = .{ .line_start = .{
+            .radius = 5,
+            .color = .{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa },
+        } },
         .origin = .{ .x = 25, .y = 50 },
         .velocity = .{ .x = 4, .y = 3 },
-        .color = .{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa },
     });
     try entities.appendBounded(.{
-        .shape = .{ .line_end = .{ .radius = line_radius2 } },
+        .shape = .line_end,
         .origin = .{ .x = 100, .y = 80 },
         .velocity = .{ .x = -3, .y = -3 },
-        .color = .{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .sprite = .{ .image = sprite, .opacity = 0xff } },
+        .origin = .{ .x = 0, .y = 0 },
+        .velocity = .{ .x = 1, .y = 1 },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .sprite = .{ .image = sprite, .opacity = 0xff / 2 } },
+        .origin = .{ .x = 20, .y = 10 },
+        .velocity = .{ .x = 1, .y = -1 },
     });
 
     var timer: std.time.Timer = try .start();
@@ -670,13 +772,21 @@ pub fn main() !void {
 
 const Entity = struct {
     const Shape = union(enum) {
-        rect: x11.Rectangle,
-        circle: struct { radius: u32 },
-        /// Must be followed by the other end.
-        line_end: struct { radius: u8 },
+        rect: struct {
+            extent: x11.Rectangle,
+            color: Image.Color,
+        },
+        circle: struct {
+            radius: u32,
+            color: Image.Color,
+        },
+        /// Must be followed by `line_end`.
+        line_start: struct { radius: u8, color: Image.Color },
+        /// Must come after `line_start`.
+        line_end: void,
+        sprite: struct { image: Image, opacity: u8 },
     };
     shape: Shape,
-    color: RenderTarget.Color,
     origin: x11.XY(i16),
     velocity: x11.XY(i16),
 
@@ -684,10 +794,10 @@ const Entity = struct {
         const entity = entities[index];
         switch (entity.shape) {
             .rect => |rect| return .{
-                .x = entity.origin.x + rect.x,
-                .y = entity.origin.y + rect.y,
-                .width = rect.width,
-                .height = rect.height,
+                .x = entity.origin.x + rect.extent.x,
+                .y = entity.origin.y + rect.extent.y,
+                .width = rect.extent.width,
+                .height = rect.extent.height,
             },
             .circle => |circle| return .{
                 .x = entity.origin.x - @as(i16, @intCast(circle.radius)),
@@ -695,15 +805,37 @@ const Entity = struct {
                 .width = @as(u16, @intCast(circle.radius)) * 2,
                 .height = @as(u16, @intCast(circle.radius)) * 2,
             },
-            .line_end => |line_end| {
-                const rn = -@as(i16, line_end.radius);
-                const r2 = @as(u16, line_end.radius) * 2;
+            .line_start => |line_start| {
+                const rn = -@as(i16, line_start.radius);
+                const r2 = @as(u16, line_start.radius) * 2;
                 return .{
                     .x = entity.origin.x + rn,
                     .y = entity.origin.y + rn,
                     .width = r2,
                     .height = r2,
                 };
+            },
+            .line_end => {
+                var result: x11.Rectangle = .{
+                    .x = entity.origin.x,
+                    .y = entity.origin.y,
+                    .width = 0,
+                    .height = 0,
+                };
+                if (index == 0) return result;
+                const prev = entities[index - 1];
+                if (prev.shape != .line_start) return result;
+                result.x -= prev.shape.line_start.radius;
+                result.y -= prev.shape.line_start.radius;
+                result.width = prev.shape.line_start.radius * 2;
+                result.height = prev.shape.line_start.radius * 2;
+                return result;
+            },
+            .sprite => |sprite| return .{
+                .x = entity.origin.x,
+                .y = entity.origin.y,
+                .width = @intCast(sprite.image.size.x),
+                .height = @intCast(sprite.image.size.y),
             },
         }
     }
@@ -731,32 +863,34 @@ const Entity = struct {
         }
     }
 
-    pub fn render(entities: []const @This(), rt: RenderTarget) void {
+    pub fn render(entities: []const @This(), rt: Image) void {
         var i: usize = 0;
         while (i < entities.len) : (i += 1) {
             const entity = entities[i];
             switch (entity.shape) {
-                .rect => rt.fillRect(
+                .rect => |rect| rt.fillRect(
                     getAabb(entities, i),
-                    entity.color,
+                    rect.color,
                 ),
                 .circle => |circle| rt.fillCircle(
                     entity.origin,
                     circle.radius,
-                    entity.color,
+                    circle.color,
                 ),
-                .line_end => |shape| {
+                .line_start => |line_end| {
                     if (i + 1 >= entities.len) continue;
                     const other = entities[i + 1];
                     if (other.shape != .line_end) continue;
                     rt.drawLine(
                         entity.origin,
                         other.origin,
-                        shape.radius,
-                        entity.color,
+                        line_end.radius,
+                        line_end.color,
                     );
                     i += 1;
                 },
+                .line_end => {},
+                .sprite => |sprite| rt.drawImage(entity.origin, sprite.image, sprite.opacity),
             }
         }
     }
@@ -767,7 +901,7 @@ fn render(
     ids: Ids,
     dbe: Dbe,
     window_size: XY(u16),
-    rt: RenderTarget,
+    rt: Image,
     entities: []const Entity,
 ) !void {
     const window = ids.window();
