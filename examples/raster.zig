@@ -1,12 +1,15 @@
 // XXX:
-// [ ] get circles right
-//     [ ] make a circle grid (offset to get clipped if needed) to test positions. do they line up vertically correctly?
+// [x] get circles right
 //     [ ] make sure 1px circle is on right point
 //     [ ] clipping on > vs >=? +1 in narrow clip?
+//         [ ] related to why adjacent circles touch horizontally but not vertically?
+// [x] lines
+//     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
 // [ ] switch to float inputs?
 // [ ] get tests running, maybe disable slow tests by default
 // [ ] profile, compare to precomputing blends, compare to f32 version
 //     [ ] vectorize/bin?
+// [ ] ask if want muladd, or enable optimized floats just in here
 
 const timer_period_ns = 16 * std.time.ns_per_ms;
 
@@ -274,9 +277,93 @@ pub const RenderTarget = struct {
         }
     }
 
+    /// Rounded cap line drawing adapted for the CPU from Inigo Quilez's line SDF.
+    pub fn drawLine(
+        self: @This(),
+        start: x11.XY(i16),
+        end: x11.XY(i16),
+        radius: u8,
+        color: Color,
+    ) void {
+        // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
+        const min: x11.XY(u32) = .{
+            .x = clamp(@min(start.x, end.x) - radius * 2, 0, self.size.x),
+            .y = clamp(@min(start.y, end.y) - radius * 2, 0, self.size.y),
+        };
+        const max: x11.XY(u32) = .{
+            .x = clamp(@max(start.x, end.x) + radius * 2, 0, self.size.x),
+            .y = clamp(@max(start.y, end.y) + radius * 2, 0, self.size.y),
+        };
+        if (min.x == max.x or min.y == max.y) return;
+
+        // Render the SDF within the AABB
+        const a_x: f32 = @floatFromInt(start.x);
+        const b_x: f32 = @floatFromInt(end.x);
+        const a_y: f32 = @floatFromInt(start.y);
+        const b_y: f32 = @floatFromInt(end.y);
+
+        const r: f32 = @floatFromInt(radius);
+        const r_early_out: f32 = r + 0.5;
+        const r_early_out2 = r_early_out * r_early_out;
+        const r_early_in: f32 = r - 0.5;
+        const r_early_in2 = r_early_in * r_early_in;
+
+        const color_p = color.premul();
+
+        const ba_y = b_y - a_y;
+        const ba_ba_y = ba_y * ba_y;
+
+        for (min.y..max.y) |y_i| {
+            const y: f32 = @floatFromInt(y_i);
+
+            const pa_y = y - a_y;
+            const pa_ba_y = pa_y * ba_y;
+
+            for (min.x..max.x) |x_i| {
+                const x: f32 = @floatFromInt(x_i);
+
+                const pa_x = x - a_x;
+                const ba_x = b_x - a_x;
+
+                const pa_dot_ba = pa_x * ba_x + pa_ba_y;
+                const ba_dot_ba = ba_x * ba_x + ba_ba_y;
+                const h = clamp(pa_dot_ba / ba_dot_ba, 0, 1);
+                const sd_x = pa_x - ba_x * h;
+                const sd_y = pa_y - ba_y * h;
+                const sd2 = sd_x * sd_x + sd_y * sd_y;
+
+                // If we're fully outside the shape, early out before the square root
+                if (sd2 > r_early_out2) {
+                    continue;
+                }
+
+                // If we're fully inside the shape, blit or alpha blend the color and early out to
+                // avoid the square root
+                if (sd2 < r_early_in2) {
+                    const sample = &self.buf[self.size.x * y_i + x_i];
+                    if (color.a == 0xff) {
+                        sample.* = color;
+                    } else {
+                        sample.* = sample.blend(color_p);
+                    }
+                    continue;
+                }
+
+                // We're on the edge, we need to do the square root and sample the SDF properly to
+                // get correct antialiasing
+                const sd = @sqrt(sd2) - r;
+                self.fillSdf(
+                    .{ .x = @intCast(x_i), .y = @intCast(y_i) },
+                    sd,
+                    color_p,
+                );
+            }
+        }
+    }
+
     /// Fills the scanline using memset if possible, falling back to a for loop if alpha blending is
     /// required. Inputs must be clamped in advance.
-    pub fn fillScanline(self: @This(), x0: u32, x1: u32, y: u32, color: Color.Premultiplied) void {
+    fn fillScanline(self: @This(), x0: u32, x1: u32, y: u32, color: Color.Premultiplied) void {
         const row_start: usize = @as(usize, y) * @as(usize, self.size.x);
         const start = row_start + x0;
         const end = row_start + x1;
@@ -286,6 +373,31 @@ pub const RenderTarget = struct {
             const sample = &self.buf[i];
             sample.* = sample.*.blend(color);
         }
+    }
+
+    fn fillSdf(self: @This(), p: x11.XY(u16), sd: f32, color: Color.Premultiplied) void {
+        // If we're fully outside the shape, early out. Otherwise get the sample.
+        if (sd > 0.5) return;
+        const sample = &self.buf[self.size.x * p.y + p.x];
+
+        // If we're fully inside the shape, blit or alpha blend the premul color.
+        if (sd < -0.5) {
+            if (color.a == 0xff) {
+                sample.* = @bitCast(color);
+            } else {
+                sample.* = sample.*.blend(color);
+            }
+            return;
+        }
+
+        // Apply antialiasing
+        const a = floatToUnorm(0.5 - sd);
+        const color_aa: Color = .scale(@bitCast(color), a);
+        sample.* = sample.*.blend(@bitCast(color_aa));
+    }
+
+    fn floatToUnorm(f: f32) u8 {
+        return @intFromFloat(f * math.maxInt(u8) + 0.5);
     }
 
     pub fn bytes(self: @This()) []u8 {
@@ -548,7 +660,6 @@ const Entity = struct {
                 .width = rect.width,
                 .height = rect.height,
             },
-            // XXX: why do they not quite touch vertically?
             .circle => |circle| return .{
                 .x = self.origin.x - @as(i16, @intCast(circle.radius)),
                 .y = self.origin.y - @as(i16, @intCast(circle.radius)),
@@ -649,6 +760,13 @@ fn render(
     }
 
     for (entities) |entity| entity.render(rt);
+    // XXX: make entity for this
+    rt.drawLine(
+        .{ .x = 0, .y = 0 },
+        .{ .x = 100, .y = 100 },
+        10,
+        .{ .r = 0, .g = 0, .b = 0, .a = 0xff },
+    );
 
     try sink.PutImage(.{
         .format = .z_pixmap,
