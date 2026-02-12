@@ -1,6 +1,8 @@
 // XXX:
+// [ ] circle
+//     [ ] change radius to bigger size?
 // [x] rects
-//     [ ] switch to extents
+//     [ ] switch to extents, decide if input should be floats first though
 // [x] get circles right
 //     [ ] make sure 1px circle is on right point
 //     [ ] clipping on > vs >=? +1 in narrow clip?
@@ -8,6 +10,7 @@
 //     [ ] lines and circles are offset slightly on stick figure
 // [x] lines
 //     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
+//     [ ] fill considered pixels with black to test
 // [x] image
 // [ ] switch to float inputs? if not clean up integer types
 // [ ] get tests running, maybe disable slow tests by default
@@ -196,99 +199,81 @@ pub const Image = struct {
         const y_min: u32 = @intCast(clamp(@as(i64, rect.y), 0, self.size.y));
         const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height, 0, self.size.y));
 
+        const width = x_max - x_min;
+
         // Premultiply the color
         const color_p = color.premul();
 
         // Fill the rect
         for (y_min..y_max) |y| {
-            self.fillScanline(x_min, x_max, @intCast(y), color_p);
+            fill(self.buf[self.size.x * y + x_min ..][0..width], color_p);
         }
     }
 
-    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u32, color: Color) void {
-        // Clip the circle if it's fully offscreen
-        if (-center.x > radius or
-            center.x > self.size.x + radius or
-            -center.y > radius or
-            center.y > self.size.y + radius)
-        {
-            return;
-        }
-        // Precompute values we'll use in the hot loop
-        const center_x: i64 = center.x;
+    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u8, color: Color) void {
+        // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
+        const min: x11.XY(u32) = .{
+            .x = clamp(@min(center.x, center.x) - radius, 0, self.size.x),
+            .y = clamp(@min(center.y, center.y) - radius, 0, self.size.y),
+        };
+        const max: x11.XY(u32) = .{
+            .x = clamp(@max(center.x, center.x) + radius, 0, self.size.x),
+            .y = clamp(@max(center.y, center.y) + radius, 0, self.size.y),
+        };
+        if (min.x == max.x or min.y == max.y) return;
+
+        // Render the SDF within the AABB
+        const mid_x: f32 = @floatFromInt(center.x);
+        const mid_y: f32 = @floatFromInt(center.y);
+
         const r: f32 = @floatFromInt(radius);
-        const r_sq = r * r;
-        const x_mid: f32 = @floatFromInt(center.x);
-        const y_mid: f32 = @floatFromInt(center.y);
+        const r2 = r * r;
+        const r_early_in: f32 = r - 0.5;
+        const r_early_in2 = r_early_in * r_early_in;
+
         const color_p = color.premul();
-        const alpha: f32 = @floatFromInt(color.a);
 
-        // Clamp the vertical bounds to the render target
-        const y_min: u32 = @intCast(clamp(@as(i64, center.y) - radius, 0, self.size.y));
-        const y_max: u32 = @intCast(clamp(@as(i64, center.y) + radius, 0, self.size.y));
-
-        // Iterate over the scanlines
-        for (y_min..y_max) |y| {
-            // Figure out the width of this scanline
-            const dy = @as(f32, @floatFromInt(y)) - y_mid;
+        for (min.y..max.y) |y| {
+            const dy = pixelCenter(y) - mid_y;
             const dy2 = dy * dy;
-            const radius_x: i64 = @intFromFloat(@ceil(@sqrt(r_sq - dy2)));
-            const x_min: i64 = center_x - radius_x + 1;
-            const x_max: i64 = center_x + radius_x;
+            const row_start = self.size.x * y;
 
-            // Fill in the scanline
-            //
-            // Avoiding range based for loop here due to this issue. If resolving, keep in mind that
-            // the min value can be over the max when clipped.
-            // https://codeberg.org/ziglang/zig/issues/31133
-            for (0..@intCast(radius_x)) |i| {
-                // Calculate the left and right x coordinates
-                const left_x: i64 = x_min + @as(u32, @intCast(i));
-                const right_x: i64 = x_max - @as(u32, @intCast(i));
+            const scanline_width: i64 = @intFromFloat(@ceil(@sqrt(@abs(r2 - dy2))));
+            var left_unclamped: i64 = @as(i64, @intCast(center.x)) - scanline_width;
+            if (left_unclamped >= self.size.x) continue;
 
-                // Clip the left and right x coordintes
-                const left_clipped = left_x < 0 or left_x >= self.size.x;
-                const right_clipped = left_x == right_x or right_x < 0 or right_x >= self.size.x;
+            while (left_unclamped < center.x) : (left_unclamped += 1) {
+                // Calculate the squared distance
+                const dx = pixelCenter(left_unclamped) - mid_x;
+                const sd2 = dx * dx + dy * dy;
+                const width: i64 = 2 * (@as(i64, @intCast(center.x)) - left_unclamped);
+                const right_unclamped = left_unclamped + width;
 
-                // Calculate the coverage
-                const x: f32 = @floatFromInt(left_x);
-                const dx = x_mid - x;
-                const dx2 = dx * dx;
-                const d2 = dy2 + dx2;
-                const d = @sqrt(d2);
-                const coverage = clamp(r - d, 0, 1);
+                // Clamp our coordinates
+                if (left_unclamped >= self.size.x or right_unclamped < 0) break;
+                const left: usize = @max(left_unclamped, 0);
+                const right: usize = @intCast(@min(right_unclamped, self.size.x));
 
-                // If the coverage is 1, we're past the antialiased region and should just fill in
-                // the rest of the scanline at full opacity.
-                if (coverage == 1) {
-                    // Clip the left and right sides of the flood fill
-                    const fill_left_unclamped = @as(i64, left_x);
-                    const fill_right_unclamped = @as(i64, @intCast(x_max)) + 1 - @as(i64, @intCast(i));
-                    const fill_left: u32 = @intCast(clamp(fill_left_unclamped, 0, self.size.x));
-                    const fill_right: u32 = @intCast(clamp(fill_right_unclamped, 0, self.size.x));
-                    self.fillScanline(fill_left, fill_right, @intCast(y), color_p);
+                // If we're fully inside the shape, fill the rest of the scanline without
+                // antialiasing.
+                if (sd2 < r_early_in2) {
+                    fill(self.buf[row_start + left .. row_start + right], color_p);
                     break;
                 }
 
-                // Calculate the antialiased color
-                const color_aa = Color.premul(.{
-                    .r = color.r,
-                    .g = color.g,
-                    .b = color.b,
-                    .a = @intFromFloat(coverage * alpha),
-                });
-
-                // Blend with the render target. The casts are safe when not clipped.
-                // cache row start?
-                const row_index = self.size.x * y;
-                if (!left_clipped) {
-                    const sample = &self.buf[row_index + @as(usize, @intCast(left_x))];
-                    sample.* = sample.*.blend(color_aa);
-                }
-                if (!right_clipped) {
-                    const sample = &self.buf[row_index + @as(usize, @intCast(right_x))];
-                    sample.* = sample.*.blend(color_aa);
-                }
+                // We're on the edge, we need to do the square root and sample the SDF properly to
+                // get correct antialiasing
+                const sd = @sqrt(sd2) - r;
+                if (left == left_unclamped) self.fillSdf(
+                    row_start + left,
+                    sd,
+                    color_p,
+                );
+                if (right == right_unclamped and right > 1) self.fillSdf(
+                    (row_start + right) - 1,
+                    sd,
+                    color_p,
+                );
             }
         }
     }
@@ -303,12 +288,12 @@ pub const Image = struct {
     ) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const min: x11.XY(u32) = .{
-            .x = clamp(@min(start.x, end.x) - radius * 2, 0, self.size.x),
-            .y = clamp(@min(start.y, end.y) - radius * 2, 0, self.size.y),
+            .x = clamp(@min(start.x, end.x) - radius, 0, self.size.x),
+            .y = clamp(@min(start.y, end.y) - radius, 0, self.size.y),
         };
         const max: x11.XY(u32) = .{
-            .x = clamp(@max(start.x, end.x) + radius * 2, 0, self.size.x),
-            .y = clamp(@max(start.y, end.y) + radius * 2, 0, self.size.y),
+            .x = clamp(@max(start.x, end.x) + radius, 0, self.size.x),
+            .y = clamp(@max(start.y, end.y) + radius, 0, self.size.y),
         };
         if (min.x == max.x or min.y == max.y) return;
 
@@ -329,18 +314,14 @@ pub const Image = struct {
         const ba_y = b_y - a_y;
         const ba_ba_y = ba_y * ba_y;
 
-        for (min.y..max.y) |y_i| {
-            const y: f32 = @floatFromInt(y_i);
-
-            const pa_y = y - a_y;
+        for (min.y..max.y) |y| {
+            const pa_y = pixelCenter(y) - a_y;
             const pa_ba_y = pa_y * ba_y;
 
-            const row_start = self.size.x * y_i;
+            const row_start = self.size.x * y;
 
-            for (min.x..max.x) |x_i| {
-                const x: f32 = @floatFromInt(x_i);
-
-                const pa_x = x - a_x;
+            for (min.x..max.x) |x| {
+                const pa_x = pixelCenter(x) - a_x;
                 const ba_x = b_x - a_x;
 
                 const pa_dot_ba = pa_x * ba_x + pa_ba_y;
@@ -358,7 +339,7 @@ pub const Image = struct {
                 // If we're fully inside the shape, blit or alpha blend the color and early out to
                 // avoid the square root
                 if (sd2 < r_early_in2) {
-                    const sample = &self.buf[row_start + x_i];
+                    const sample = &self.buf[row_start + x];
                     sample.* = sample.blendOrBlit(color_p);
                     continue;
                 }
@@ -367,7 +348,7 @@ pub const Image = struct {
                 // get correct antialiasing
                 const sd = @sqrt(sd2) - r;
                 self.fillSdf(
-                    row_start + x_i,
+                    row_start + x,
                     sd,
                     color_p,
                 );
@@ -375,7 +356,7 @@ pub const Image = struct {
         }
     }
 
-    fn drawImage(self: @This(), origin: x11.XY(i16), image: @This(), opacity: u8) void {
+    pub fn drawImage(self: @This(), origin: x11.XY(i16), image: @This(), opacity: u8) void {
         const min_dst: x11.XY(u32) = .{
             .x = clamp(origin.x, 0, self.size.x),
             .y = clamp(origin.y, 0, self.size.y),
@@ -399,16 +380,12 @@ pub const Image = struct {
         }
     }
 
-    /// Fills the scanline using memset if possible, falling back to a for loop if alpha blending is
-    /// required. Inputs must be clamped in advance.
-    fn fillScanline(self: @This(), x0: u32, x1: u32, y: u32, color: Color.Premultiplied) void {
-        const row_start: usize = @as(usize, y) * @as(usize, self.size.x);
-        const start = row_start + x0;
-        const end = row_start + x1;
+    /// Fills the range of pixels using memset if possible, falling back to a for loop if alpha
+    /// blending is required.
+    fn fill(slice: []Color.Premultiplied, color: Color.Premultiplied) void {
         if (color.a == 0xff) {
-            @memset(self.buf[start..end], color);
-        } else for (start..end) |i| {
-            const sample = &self.buf[i];
+            @memset(slice, color);
+        } else for (slice) |*sample| {
             sample.* = sample.*.blend(color);
         }
     }
@@ -427,6 +404,11 @@ pub const Image = struct {
         // Apply antialiasing
         const a = floatToUnorm(0.5 - sd);
         sample.* = sample.*.blend(color.scale(a));
+    }
+
+    /// Returns the floating point coordinate of the given pixel's center.
+    fn pixelCenter(i: anytype) f32 {
+        return @as(f32, @floatFromInt(i)) + 0.5;
     }
 
     fn floatToUnorm(f: f32) u8 {
@@ -563,7 +545,7 @@ pub fn main() !void {
         .r = 0x00,
         .g = 0x00,
         .b = 0x00,
-        .a = 0x0,
+        .a = 0x00,
     });
     sprite.fillCircle(
         .{ .x = 32, .y = 10 },
@@ -693,14 +675,14 @@ pub fn main() !void {
         .velocity = .{ .x = -3, .y = -3 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .sprite = .{ .image = sprite, .opacity = 0xff } },
-        .origin = .{ .x = 0, .y = 0 },
-        .velocity = .{ .x = 1, .y = 1 },
-    });
-    try entities.appendBounded(.{
         .shape = .{ .sprite = .{ .image = sprite, .opacity = 0xff / 2 } },
         .origin = .{ .x = 20, .y = 10 },
         .velocity = .{ .x = 1, .y = -1 },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .sprite = .{ .image = sprite, .opacity = 0xff } },
+        .origin = .{ .x = 0, .y = 20 },
+        .velocity = .{ .x = 1, .y = 1 },
     });
 
     var timer: std.time.Timer = try .start();
@@ -777,7 +759,7 @@ const Entity = struct {
             color: Image.Color,
         },
         circle: struct {
-            radius: u32,
+            radius: u8,
             color: Image.Color,
         },
         /// Must be followed by `line_end`.
