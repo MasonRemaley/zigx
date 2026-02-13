@@ -210,7 +210,7 @@ pub const Image = struct {
         }
     }
 
-    // XXX: optimize, much of this can be filled/mirrored etc
+    /// Renders a rounded rectangle.
     pub fn fillRoundedRect(self: @This(), rect: x11.Rectangle, radius: u32, color: Color) void {
         // Clamp the bounds to the render target
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
@@ -230,18 +230,32 @@ pub const Image = struct {
         // Premultiply the color
         const color_p = color.premul();
 
-        // Fill the rounded rect
+        // Fill the rounded rect. We could do 1/4th as many square roots by taking advantage of the
+        // four way symmetry, but we opted not do as this complicates clipping and jumps around in
+        // memory more.
         for (y_min..y_max) |y_i| {
             const y: f32 = pixelCenter(y_i);
+            const row_start = self.size.x * y_i;
 
             const p_y = y - half_height - bottom;
             const q_y = @abs(p_y) - half_height + r;
             const q_y_max = @max(q_y, 0);
             const q_y_max2 = q_y_max * q_y_max;
 
-            for (x_min..x_max) |x_i| {
+            var x_i = x_min;
+            while (x_i < x_max) : (x_i += 1) {
                 const x: f32 = pixelCenter(x_i);
 
+                // If we're in the interior rect, just fill it in so we can skip the square root
+                if (@as(i64, @intCast(x_i)) - rect.x == radius) {
+                    const skip_to_unclamped = @as(i64, rect.x) + rect.width - radius;
+                    const skip_to: u32 = @intCast(@min(skip_to_unclamped, self.size.x));
+                    fill(self.buf[row_start + x_i ..][0 .. skip_to - x_i], color_p);
+                    x_i = skip_to;
+                    if (x_i >= x_max) break;
+                }
+
+                // Otherwise, evaluate the SDF
                 const p_x = x - half_width - left;
                 const q_x = @abs(p_x) - half_width + r;
                 const q_x_max = @max(q_x, 0);
@@ -251,7 +265,7 @@ pub const Image = struct {
 
                 const sd = @min(@max(q_x, q_y), 0) + q_max_len - r;
 
-                self.fillSdf(self.size.x * y_i + x_i, sd, color_p);
+                self.fillSdf(row_start + x_i, sd, color_p);
             }
         }
     }
@@ -279,6 +293,9 @@ pub const Image = struct {
 
         const color_p = color.premul();
 
+        // Evaluate the SDF. We take advtange of horizontal symmetry here, but not vertical
+        // symmetry. At the cost of jumping around in memory more and increased clipping complexity,
+        // we could reduce the square roots by half.
         for (min.y..max.y) |y| {
             const dy = pixelCenter(y) - mid_y;
             const dy2 = dy * dy;
@@ -971,36 +988,20 @@ fn render(
             var col: i16 = 0;
             while (col <= window_size.y / cell_size) : (col += 1) {
                 const x = col * cell_size * 2 + cell_size * @mod(row, 2);
-                // XXX: ...switch these back
-                rt.fillRoundedRect(
+                rt.fillRect(
                     .{
                         .x = x,
                         .y = y,
                         .width = cell_size,
                         .height = cell_size,
                     },
-                    3,
                     .{
                         .r = 0x00,
                         .g = 0x00,
-                        .b = 0xff,
+                        .b = 0x00,
                         .a = 0x40,
                     },
                 );
-                // rt.fillRect(
-                //     .{
-                //         .x = x,
-                //         .y = y,
-                //         .width = cell_size,
-                //         .height = cell_size,
-                //     },
-                //     .{
-                //         .r = 0xff,
-                //         .g = 0x00,
-                //         .b = 0x00,
-                //         .a = 0x40,
-                //     },
-                // );
             }
         }
     }
