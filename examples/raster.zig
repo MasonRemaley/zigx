@@ -210,6 +210,52 @@ pub const Image = struct {
         }
     }
 
+    // XXX: optimize, much of this can be filled/mirrored etc
+    pub fn fillRoundedRect(self: @This(), rect: x11.Rectangle, radius: u32, color: Color) void {
+        // Clamp the bounds to the render target
+        const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
+        const x_max: u32 = @intCast(clamp(@as(i64, rect.x) + rect.width, 0, self.size.x));
+        const y_min: u32 = @intCast(clamp(@as(i64, rect.y), 0, self.size.y));
+        const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height, 0, self.size.y));
+
+        // Precompute values for sdf
+        const r: f32 = @floatFromInt(radius);
+        const width: f32 = @floatFromInt(rect.width);
+        const height: f32 = @floatFromInt(rect.height);
+        const half_width = width / 2;
+        const half_height = height / 2;
+        const left: f32 = @floatFromInt(rect.x);
+        const bottom: f32 = @floatFromInt(rect.y);
+
+        // Premultiply the color
+        const color_p = color.premul();
+
+        // Fill the rounded rect
+        for (y_min..y_max) |y_i| {
+            const y: f32 = pixelCenter(y_i);
+
+            const p_y = y - half_height - bottom;
+            const q_y = @abs(p_y) - half_height + r;
+            const q_y_max = @max(q_y, 0);
+            const q_y_max2 = q_y_max * q_y_max;
+
+            for (x_min..x_max) |x_i| {
+                const x: f32 = pixelCenter(x_i);
+
+                const p_x = x - half_width - left;
+                const q_x = @abs(p_x) - half_width + r;
+                const q_x_max = @max(q_x, 0);
+                const q_x_max2 = q_x_max * q_x_max;
+
+                const q_max_len = @sqrt(q_x_max2 + q_y_max2);
+
+                const sd = @min(@max(q_x, q_y), 0) + q_max_len - r;
+
+                self.fillSdf(self.size.x * y_i + x_i, sd, color_p);
+            }
+        }
+    }
+
     pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u8, color: Color) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const min: x11.XY(u32) = .{
@@ -612,13 +658,14 @@ pub fn main() !void {
         .velocity = .{ .x = 3, .y = 4 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .rect = .{
+        .shape = .{ .rounded_rect = .{
             .extent = .{
                 .x = 100,
                 .y = 50,
                 .width = 50,
                 .height = 100,
             },
+            .radius = 20,
             .color = .{ .r = 0xff, .g = 0xaa, .b = 0xaa, .a = 0xaa },
         } },
         .origin = .{ .x = 0, .y = 0 },
@@ -758,6 +805,11 @@ const Entity = struct {
             extent: x11.Rectangle,
             color: Image.Color,
         },
+        rounded_rect: struct {
+            extent: x11.Rectangle,
+            radius: u32,
+            color: Image.Color,
+        },
         circle: struct {
             radius: u8,
             color: Image.Color,
@@ -775,7 +827,7 @@ const Entity = struct {
     pub fn getAabb(entities: []const @This(), index: usize) x11.Rectangle {
         const entity = entities[index];
         switch (entity.shape) {
-            .rect => |rect| return .{
+            inline .rect, .rounded_rect => |rect| return .{
                 .x = entity.origin.x + rect.extent.x,
                 .y = entity.origin.y + rect.extent.y,
                 .width = rect.extent.width,
@@ -854,6 +906,11 @@ const Entity = struct {
                     getAabb(entities, i),
                     rect.color,
                 ),
+                .rounded_rect => |rect| rt.fillRoundedRect(
+                    getAabb(entities, i),
+                    rect.radius,
+                    rect.color,
+                ),
                 .circle => |circle| rt.fillCircle(
                     entity.origin,
                     circle.radius,
@@ -914,20 +971,36 @@ fn render(
             var col: i16 = 0;
             while (col <= window_size.y / cell_size) : (col += 1) {
                 const x = col * cell_size * 2 + cell_size * @mod(row, 2);
-                rt.fillRect(
+                // XXX: ...switch these back
+                rt.fillRoundedRect(
                     .{
                         .x = x,
                         .y = y,
                         .width = cell_size,
                         .height = cell_size,
                     },
+                    3,
                     .{
                         .r = 0x00,
                         .g = 0x00,
-                        .b = 0x00,
+                        .b = 0xff,
                         .a = 0x40,
                     },
                 );
+                // rt.fillRect(
+                //     .{
+                //         .x = x,
+                //         .y = y,
+                //         .width = cell_size,
+                //         .height = cell_size,
+                //     },
+                //     .{
+                //         .r = 0xff,
+                //         .g = 0x00,
+                //         .b = 0x00,
+                //         .a = 0x40,
+                //     },
+                // );
             }
         }
     }
