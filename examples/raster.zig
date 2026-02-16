@@ -270,6 +270,80 @@ pub const Image = struct {
         }
     }
 
+    /// Renders a rounded rectangle.
+    pub fn drawRoundedRect(
+        self: @This(),
+        rect: x11.Rectangle,
+        radius: u32,
+        stroke_size: f32,
+        color: Color,
+    ) void {
+        const half_stroke = stroke_size / 2;
+        const half_stroke_ceil: i64 = @intFromFloat(@ceil(half_stroke));
+        const stroke_floor: i64 = @intFromFloat(@floor(stroke_size));
+
+        // Clamp the bounds to the render target
+        const x_min: u32 = @intCast(clamp(@as(i64, rect.x) - half_stroke_ceil, 0, self.size.x));
+        const x_max: u32 = @intCast(clamp(@as(i64, rect.x) + rect.width + half_stroke_ceil, 0, self.size.x));
+        const y_min: u32 = @intCast(clamp(@as(i64, rect.y) - half_stroke_ceil, 0, self.size.y));
+        const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height + half_stroke_ceil, 0, self.size.y));
+
+        // Precompute values for sdf
+        const r: f32 = @floatFromInt(radius);
+        const width: f32 = @floatFromInt(rect.width);
+        const height: f32 = @floatFromInt(rect.height);
+        const half_width = width / 2;
+        const half_height = height / 2;
+        const left: f32 = @floatFromInt(rect.x);
+        const bottom: f32 = @floatFromInt(rect.y);
+
+        // Premultiply the color
+        const color_p = color.premul();
+
+        // Fill the rounded rect. We could do 1/4th as many square roots by taking advantage of the
+        // four way symmetry, but we opted not do as this complicates clipping and jumps around in
+        // memory more.
+        for (y_min..y_max) |y_i| {
+            const y: f32 = pixelCenter(y_i);
+            const row_start = self.size.x * y_i;
+
+            const p_y = y - half_height - bottom;
+            const q_y = @abs(p_y) - half_height + r;
+            const q_y_max = @max(q_y, 0);
+            const q_y_max2 = q_y_max * q_y_max;
+
+            var x_i = x_min;
+            while (x_i < x_max) : (x_i += 1) {
+                const x: f32 = pixelCenter(x_i);
+
+                // If we're in the interior rect, skip it to avoid the square root
+                if (@as(i64, @intCast(x_i)) - rect.x + stroke_floor == radius and
+                    @as(i64, @intCast(y_i)) - rect.y >= radius - stroke_floor and
+                    @as(i64, @intCast(y_i)) - rect.y <= rect.height - radius + stroke_floor)
+                {
+                    const skip_to_unclamped = @as(i64, rect.x) + rect.width - radius + stroke_floor;
+                    const skip_to: u32 = @intCast(@min(skip_to_unclamped, self.size.x));
+                    if (skip_to < x_i) break;
+                    x_i = skip_to;
+                    if (x_i >= x_max) break;
+                }
+
+                // Otherwise, evaluate the SDF
+                const p_x = x - half_width - left;
+                const q_x = @abs(p_x) - half_width + r;
+                const q_x_max = @max(q_x, 0);
+                const q_x_max2 = q_x_max * q_x_max;
+
+                const q_max_len = @sqrt(q_x_max2 + q_y_max2);
+
+                const sd_fill = @min(@max(q_x, q_y), 0) + q_max_len - r;
+                const sd = subtractSdf(sd_fill + half_stroke, sd_fill - half_stroke);
+
+                self.fillSdf(row_start + x_i, sd, color_p);
+            }
+        }
+    }
+
     pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u8, color: Color) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const min: x11.XY(u32) = .{
@@ -758,7 +832,7 @@ pub fn main() !void {
         .velocity = .{ .x = 3, .y = 4 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .rounded_rect = .{
+        .shape = .{ .fill_rounded_rect = .{
             .extent = .{
                 .x = 100,
                 .y = 50,
@@ -770,6 +844,21 @@ pub fn main() !void {
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 2, .y = 4 },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .draw_rounded_rect = .{
+            .extent = .{
+                .x = 50,
+                .y = 100,
+                .width = 50,
+                .height = 100,
+            },
+            .radius = 20,
+            .stroke_size = 10,
+            .color = .{ .r = 0xaa, .g = 0x00, .b = 0xaa, .a = 0xaa },
+        } },
+        .origin = .{ .x = 0, .y = 0 },
+        .velocity = .{ .x = 2, .y = 3 },
     });
     try entities.appendBounded(.{
         .shape = .{ .fill_circle = .{
@@ -798,7 +887,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .draw_circle = .{
             .radius = 50,
-            .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
+            .color = .{ .r = 0x00, .g = 0xaa, .b = 0xaa, .a = 0xaa },
             .stroke_size = 2,
         } },
         .origin = .{ .x = 5, .y = 10 },
@@ -932,9 +1021,15 @@ const Entity = struct {
             extent: x11.Rectangle,
             color: Image.Color,
         },
-        rounded_rect: struct {
+        fill_rounded_rect: struct {
             extent: x11.Rectangle,
             radius: u32,
+            color: Image.Color,
+        },
+        draw_rounded_rect: struct {
+            extent: x11.Rectangle,
+            radius: u32,
+            stroke_size: f32,
             color: Image.Color,
         },
         fill_circle: struct {
@@ -959,11 +1054,20 @@ const Entity = struct {
     pub fn getAabb(entities: []const @This(), index: usize) x11.Rectangle {
         const entity = entities[index];
         switch (entity.shape) {
-            inline .rect, .rounded_rect => |rect| return .{
+            inline .rect, .fill_rounded_rect => |rect| return .{
                 .x = entity.origin.x + rect.extent.x,
                 .y = entity.origin.y + rect.extent.y,
                 .width = rect.extent.width,
                 .height = rect.extent.height,
+            },
+            .draw_rounded_rect => |rect| {
+                const stroke_size: i16 = @intFromFloat(@ceil(rect.stroke_size));
+                return .{
+                    .x = entity.origin.x + rect.extent.x - stroke_size,
+                    .y = entity.origin.y + rect.extent.y - stroke_size,
+                    .width = rect.extent.width + @as(u16, @intCast(stroke_size)),
+                    .height = rect.extent.height + @as(u16, @intCast(stroke_size)),
+                };
             },
             .fill_circle => |circle| return .{
                 .x = entity.origin.x - @as(i16, @intCast(circle.radius)),
@@ -1047,9 +1151,15 @@ const Entity = struct {
                     getAabb(entities, i),
                     rect.color,
                 ),
-                .rounded_rect => |rect| rt.fillRoundedRect(
+                .fill_rounded_rect => |rect| rt.fillRoundedRect(
                     getAabb(entities, i),
                     rect.radius,
+                    rect.color,
+                ),
+                .draw_rounded_rect => |rect| rt.drawRoundedRect(
+                    getAabb(entities, i),
+                    rect.radius,
+                    rect.stroke_size,
                     rect.color,
                 ),
                 .fill_circle => |circle| rt.fillCircle(
