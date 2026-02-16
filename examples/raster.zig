@@ -1,5 +1,5 @@
 // XXX:
-// [ ] circle
+// [x] circle
 //     [ ] change radius to bigger size?
 // [x] rects
 //     [ ] switch to extents, decide if input should be floats first though
@@ -12,11 +12,11 @@
 //     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
 //     [ ] fill considered pixels with black to test
 // [x] image
-// [ ] switch to float inputs? if not clean up integer types
+// [ ] clean up integer types
 // [ ] get tests running, maybe disable slow tests by default
 // [ ] profile, compare to precomputing blends, compare to f32 version
 //     [ ] vectorize/bin?
-// [ ] ask if want muladd, or enable optimized floats just in here
+// [ ] research cpus/muladd
 
 const timer_period_ns = 16 * std.time.ns_per_ms;
 
@@ -341,6 +341,85 @@ pub const Image = struct {
         }
     }
 
+    pub fn drawCircle(
+        self: @This(),
+        center: x11.XY(i16),
+        radius: u8,
+        stroke_size: f32,
+        color: Color,
+    ) void {
+        // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
+        const half_stroke = stroke_size / 2;
+        const half_stroke_ceil: i16 = @intFromFloat(@ceil(half_stroke));
+        const min: x11.XY(u32) = .{
+            .x = clamp(@min(center.x, center.x) - radius - half_stroke_ceil, 0, self.size.x),
+            .y = clamp(@min(center.y, center.y) - radius - half_stroke_ceil, 0, self.size.y),
+        };
+        const max: x11.XY(u32) = .{
+            .x = clamp(@max(center.x, center.x) + radius + half_stroke_ceil, 0, self.size.x),
+            .y = clamp(@max(center.y, center.y) + radius + half_stroke_ceil, 0, self.size.y),
+        };
+        if (min.x == max.x or min.y == max.y) return;
+
+        // Render the SDF within the AABB
+        const mid_x: f32 = @floatFromInt(center.x);
+        const mid_y: f32 = @floatFromInt(center.y);
+
+        const r_raw: f32 = @floatFromInt(radius);
+        const r_outer = r_raw + half_stroke;
+        const r_inner = r_raw - half_stroke;
+        const r_outer2 = r_outer * r_outer;
+        const r_early_out: f32 = r_inner - 0.5;
+        const r_early_out2 = r_early_out * r_early_out;
+
+        const color_p = color.premul();
+
+        // Evaluate the SDF. We take advtange of horizontal symmetry here, but not vertical
+        // symmetry. At the cost of jumping around in memory more and increased clipping complexity,
+        // we could reduce the square roots by half.
+        for (min.y..max.y) |y| {
+            const dy = pixelCenter(y) - mid_y;
+            const dy2 = dy * dy;
+            const row_start = self.size.x * y;
+
+            const scanline_width: i64 = @intFromFloat(@ceil(@sqrt(@abs(r_outer2 - dy2))));
+            var left_unclamped: i64 = @as(i64, @intCast(center.x)) - scanline_width;
+            if (left_unclamped >= self.size.x) continue;
+
+            while (left_unclamped < center.x) : (left_unclamped += 1) {
+                // Calculate the squared distance
+                const dx = pixelCenter(left_unclamped) - mid_x;
+                const sd2 = dx * dx + dy * dy;
+                const width: i64 = 2 * (@as(i64, @intCast(center.x)) - left_unclamped);
+                const right_unclamped = left_unclamped + width;
+
+                // Clamp our coordinates
+                if (left_unclamped >= self.size.x or right_unclamped < 0) break;
+                const left: usize = @max(left_unclamped, 0);
+                const right: usize = @intCast(@min(right_unclamped, self.size.x));
+
+                // If we're fully inside the shape, skip the rest of the scanline
+                if (sd2 < r_early_out2) break;
+
+                // We're on the edge, we need to do the square root and sample the SDF properly to
+                // get correct antialiasing
+                const sd_outer = @sqrt(sd2) - r_outer;
+                const sd_inner = sd_outer + stroke_size;
+                const sd = subtractSdf(sd_inner, sd_outer);
+                if (left == left_unclamped) self.fillSdf(
+                    row_start + left,
+                    sd,
+                    color_p,
+                );
+                if (right == right_unclamped and right > 1) self.fillSdf(
+                    (row_start + right) - 1,
+                    sd,
+                    color_p,
+                );
+            }
+        }
+    }
+
     /// Rounded cap line drawing adapted for the CPU from Inigo Quilez's line SDF.
     pub fn drawLine(
         self: @This(),
@@ -451,6 +530,10 @@ pub const Image = struct {
         } else for (slice) |*sample| {
             sample.* = sample.*.blend(color);
         }
+    }
+
+    fn subtractSdf(lhs: f32, rhs: f32) f32 {
+        return @max(-lhs, rhs);
     }
 
     fn fillSdf(self: @This(), index: usize, sd: f32, color: Color.Premultiplied) void {
@@ -689,7 +772,7 @@ pub fn main() !void {
         .velocity = .{ .x = 2, .y = 4 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .circle = .{
+        .shape = .{ .fill_circle = .{
             .radius = 50,
             .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
         } },
@@ -697,7 +780,7 @@ pub fn main() !void {
         .velocity = .{ .x = -4, .y = 0 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .circle = .{
+        .shape = .{ .fill_circle = .{
             .radius = 25,
             .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
         } },
@@ -705,12 +788,39 @@ pub fn main() !void {
         .velocity = .{ .x = 4, .y = -2 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .circle = .{
+        .shape = .{ .fill_circle = .{
             .radius = 30,
             .color = .{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa },
         } },
         .origin = .{ .x = 100, .y = 20 },
         .velocity = .{ .x = 3, .y = 2 },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .draw_circle = .{
+            .radius = 50,
+            .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
+            .stroke_size = 2,
+        } },
+        .origin = .{ .x = 5, .y = 10 },
+        .velocity = .{ .x = -3, .y = 0 },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .draw_circle = .{
+            .radius = 25,
+            .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
+            .stroke_size = 10,
+        } },
+        .origin = .{ .x = 20, .y = 5 },
+        .velocity = .{ .x = 4, .y = -3 },
+    });
+    try entities.appendBounded(.{
+        .shape = .{ .draw_circle = .{
+            .radius = 30,
+            .color = .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+            .stroke_size = 1,
+        } },
+        .origin = .{ .x = 100, .y = 20 },
+        .velocity = .{ .x = 3, .y = 3 },
     });
     try entities.appendBounded(.{
         .shape = .{ .line_start = .{
@@ -827,9 +937,14 @@ const Entity = struct {
             radius: u32,
             color: Image.Color,
         },
-        circle: struct {
+        fill_circle: struct {
             radius: u8,
             color: Image.Color,
+        },
+        draw_circle: struct {
+            radius: u8,
+            color: Image.Color,
+            stroke_size: f32,
         },
         /// Must be followed by `line_end`.
         line_start: struct { radius: u8, color: Image.Color },
@@ -850,11 +965,20 @@ const Entity = struct {
                 .width = rect.extent.width,
                 .height = rect.extent.height,
             },
-            .circle => |circle| return .{
+            .fill_circle => |circle| return .{
                 .x = entity.origin.x - @as(i16, @intCast(circle.radius)),
                 .y = entity.origin.y - @as(i16, @intCast(circle.radius)),
                 .width = @as(u16, @intCast(circle.radius)) * 2,
                 .height = @as(u16, @intCast(circle.radius)) * 2,
+            },
+            .draw_circle => |circle| {
+                const r: i16 = @intFromFloat(@ceil(@as(f32, @floatFromInt(circle.radius)) + circle.stroke_size / 2));
+                return .{
+                    .x = entity.origin.x - r,
+                    .y = entity.origin.y - r,
+                    .width = @as(u16, @intCast(r)) * 2,
+                    .height = @as(u16, @intCast(r)) * 2,
+                };
             },
             .line_start => |line_start| {
                 const rn = -@as(i16, line_start.radius);
@@ -928,9 +1052,15 @@ const Entity = struct {
                     rect.radius,
                     rect.color,
                 ),
-                .circle => |circle| rt.fillCircle(
+                .fill_circle => |circle| rt.fillCircle(
                     entity.origin,
                     circle.radius,
+                    circle.color,
+                ),
+                .draw_circle => |circle| rt.drawCircle(
+                    entity.origin,
+                    circle.radius,
+                    circle.stroke_size,
                     circle.color,
                 ),
                 .line_start => |line_end| {
