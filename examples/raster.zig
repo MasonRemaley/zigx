@@ -1,18 +1,11 @@
 // XXX:
-// [x] circle
-//     [ ] change radius to bigger size?
-// [x] rects
+// * rects
 //     [ ] switch to extents, decide if input should be floats first though
-// [x] get circles right
+// * get circles right
 //     [ ] make sure 1px circle is on right point
-//     [ ] clipping on > vs >=? +1 in narrow clip?
-//         [ ] related to why adjacent circles touch horizontally but not vertically?
-//     [ ] lines and circles are offset slightly on stick figure
-// [x] lines
+// * lines
 //     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
 //     [ ] fill considered pixels with black to test
-// [x] image
-// [ ] clean up integer types
 // [ ] get tests running, maybe disable slow tests by default
 // [ ] profile, compare to precomputing blends, compare to f32 version
 //     [ ] vectorize/bin?
@@ -211,15 +204,15 @@ pub const Image = struct {
     }
 
     /// Renders a rounded rectangle.
-    pub fn fillRoundedRect(self: @This(), rect: x11.Rectangle, radius: u32, color: Color) void {
+    pub fn fillRoundedRect(self: @This(), rect: x11.Rectangle, radius: f32, color: Color) void {
         // Clamp the bounds to the render target
+        const radius_ceil = posIntFromFloat(i64, @ceil(radius));
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
         const x_max: u32 = @intCast(clamp(@as(i64, rect.x) + rect.width, 0, self.size.x));
         const y_min: u32 = @intCast(clamp(@as(i64, rect.y), 0, self.size.y));
         const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height, 0, self.size.y));
 
         // Precompute values for sdf
-        const r: f32 = @floatFromInt(radius);
         const width: f32 = @floatFromInt(rect.width);
         const height: f32 = @floatFromInt(rect.height);
         const half_width = width / 2;
@@ -238,7 +231,7 @@ pub const Image = struct {
             const row_start = self.size.x * y_i;
 
             const p_y = y - half_height - bottom;
-            const q_y = @abs(p_y) - half_height + r;
+            const q_y = @abs(p_y) - half_height + radius;
             const q_y_max = @max(q_y, 0);
             const q_y_max2 = q_y_max * q_y_max;
 
@@ -247,23 +240,26 @@ pub const Image = struct {
                 const x: f32 = pixelCenter(x_i);
 
                 // If we're in the interior rect, just fill it in so we can skip the square root
-                if (@as(i64, @intCast(x_i)) - rect.x == radius) {
-                    const skip_to_unclamped = @as(i64, rect.x) + rect.width - radius;
-                    const skip_to: u32 = @intCast(@min(skip_to_unclamped, self.size.x));
-                    fill(self.buf[row_start + x_i ..][0 .. skip_to - x_i], color_p);
-                    x_i = skip_to;
-                    if (x_i >= x_max) break;
+                if (@as(i64, @intCast(x_i)) - rect.x >= radius_ceil) {
+                    const skip_to_unclamped = @as(i64, rect.x) + rect.width - radius_ceil;
+                    const skip_to: i64 = @intCast(@min(skip_to_unclamped, self.size.x));
+                    if (x_i < skip_to) {
+                        const skip_to_u: u32 = @intCast(skip_to);
+                        fill(self.buf[row_start + x_i ..][0 .. skip_to_u - x_i], color_p);
+                        x_i = skip_to_u;
+                        if (x_i >= x_max) break;
+                    }
                 }
 
                 // Otherwise, evaluate the SDF
                 const p_x = x - half_width - left;
-                const q_x = @abs(p_x) - half_width + r;
+                const q_x = @abs(p_x) - half_width + radius;
                 const q_x_max = @max(q_x, 0);
                 const q_x_max2 = q_x_max * q_x_max;
 
                 const q_max_len = @sqrt(q_x_max2 + q_y_max2);
 
-                const sd = @min(@max(q_x, q_y), 0) + q_max_len - r;
+                const sd = @min(@max(q_x, q_y), 0) + q_max_len - radius;
 
                 self.fillSdf(row_start + x_i, sd, color_p);
             }
@@ -274,13 +270,16 @@ pub const Image = struct {
     pub fn drawRoundedRect(
         self: @This(),
         rect: x11.Rectangle,
-        radius: u32,
+        radius: f32,
         stroke_size: f32,
         color: Color,
     ) void {
         const half_stroke = stroke_size / 2;
-        const half_stroke_ceil: i64 = @intFromFloat(@ceil(half_stroke));
-        const stroke_floor: i64 = @intFromFloat(@floor(stroke_size));
+        const half_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(half_stroke));
+        const radius_minus_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(radius - stroke_size));
+        const radius_plus_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(radius + stroke_size));
+        const height_minus_radius_plus_stroke_ceil: i64 = rect.height -| radius_plus_stroke_ceil;
+        const width_minus_radius_plus_stroke_ceil: i64 = rect.width -| radius_plus_stroke_ceil;
 
         // Clamp the bounds to the render target
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x) - half_stroke_ceil, 0, self.size.x));
@@ -289,7 +288,6 @@ pub const Image = struct {
         const y_max: u32 = @intCast(clamp(@as(i64, rect.y) + rect.height + half_stroke_ceil, 0, self.size.y));
 
         // Precompute values for sdf
-        const r: f32 = @floatFromInt(radius);
         const width: f32 = @floatFromInt(rect.width);
         const height: f32 = @floatFromInt(rect.height);
         const half_width = width / 2;
@@ -308,7 +306,7 @@ pub const Image = struct {
             const row_start = self.size.x * y_i;
 
             const p_y = y - half_height - bottom;
-            const q_y = @abs(p_y) - half_height + r;
+            const q_y = @abs(p_y) - half_height + radius;
             const q_y_max = @max(q_y, 0);
             const q_y_max2 = q_y_max * q_y_max;
 
@@ -317,26 +315,28 @@ pub const Image = struct {
                 const x: f32 = pixelCenter(x_i);
 
                 // If we're in the interior rect, skip it to avoid the square root
-                if (@as(i64, @intCast(x_i)) - rect.x + stroke_floor == radius and
-                    @as(i64, @intCast(y_i)) - rect.y >= radius - stroke_floor and
-                    @as(i64, @intCast(y_i)) - rect.y <= rect.height - radius + stroke_floor)
+                if (@as(i64, @intCast(x_i)) - rect.x >= radius_minus_stroke_ceil and
+                    @as(i64, @intCast(y_i)) - rect.y >= radius_minus_stroke_ceil and
+                    @as(i64, @intCast(y_i)) - rect.y <= height_minus_radius_plus_stroke_ceil)
                 {
-                    const skip_to_unclamped = @as(i64, rect.x) + rect.width - radius + stroke_floor;
-                    const skip_to: u32 = @intCast(@min(skip_to_unclamped, self.size.x));
-                    if (skip_to < x_i) break;
-                    x_i = skip_to;
-                    if (x_i >= x_max) break;
+                    const skip_to_unclamped = @as(i64, rect.x) + width_minus_radius_plus_stroke_ceil;
+                    const skip_to: i64 = @intCast(@min(skip_to_unclamped, self.size.x));
+                    if (skip_to > x_i) {
+                        const skip_to_u: u32 = @intCast(skip_to);
+                        x_i = skip_to_u;
+                        if (x_i >= x_max) break;
+                    }
                 }
 
                 // Otherwise, evaluate the SDF
                 const p_x = x - half_width - left;
-                const q_x = @abs(p_x) - half_width + r;
+                const q_x = @abs(p_x) - half_width + radius;
                 const q_x_max = @max(q_x, 0);
                 const q_x_max2 = q_x_max * q_x_max;
 
                 const q_max_len = @sqrt(q_x_max2 + q_y_max2);
 
-                const sd_fill = @min(@max(q_x, q_y), 0) + q_max_len - r;
+                const sd_fill = @min(@max(q_x, q_y), 0) + q_max_len - radius;
                 const sd = subtractSdf(sd_fill + half_stroke, sd_fill - half_stroke);
 
                 self.fillSdf(row_start + x_i, sd, color_p);
@@ -344,15 +344,16 @@ pub const Image = struct {
         }
     }
 
-    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: u8, color: Color) void {
+    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: f32, color: Color) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
+        const radius_ceil = posIntFromFloat(i16, @ceil(radius));
         const min: x11.XY(u32) = .{
-            .x = clamp(@min(center.x, center.x) - radius, 0, self.size.x),
-            .y = clamp(@min(center.y, center.y) - radius, 0, self.size.y),
+            .x = clamp(@min(center.x, center.x) - radius_ceil, 0, self.size.x),
+            .y = clamp(@min(center.y, center.y) - radius_ceil, 0, self.size.y),
         };
         const max: x11.XY(u32) = .{
-            .x = clamp(@max(center.x, center.x) + radius, 0, self.size.x),
-            .y = clamp(@max(center.y, center.y) + radius, 0, self.size.y),
+            .x = clamp(@max(center.x, center.x) + radius_ceil, 0, self.size.x),
+            .y = clamp(@max(center.y, center.y) + radius_ceil, 0, self.size.y),
         };
         if (min.x == max.x or min.y == max.y) return;
 
@@ -360,9 +361,8 @@ pub const Image = struct {
         const mid_x: f32 = @floatFromInt(center.x);
         const mid_y: f32 = @floatFromInt(center.y);
 
-        const r: f32 = @floatFromInt(radius);
-        const r2 = r * r;
-        const r_early_in: f32 = r - 0.5;
+        const r2 = radius * radius;
+        const r_early_in: f32 = radius - 0.5;
         const r_early_in2 = r_early_in * r_early_in;
 
         const color_p = color.premul();
@@ -375,7 +375,7 @@ pub const Image = struct {
             const dy2 = dy * dy;
             const row_start = self.size.x * y;
 
-            const scanline_width: i64 = @intFromFloat(@ceil(@sqrt(@abs(r2 - dy2))));
+            const scanline_width = posIntFromFloat(i64, @ceil(@sqrt(@abs(r2 - dy2))));
             var left_unclamped: i64 = @as(i64, @intCast(center.x)) - scanline_width;
             if (left_unclamped >= self.size.x) continue;
 
@@ -400,7 +400,7 @@ pub const Image = struct {
 
                 // We're on the edge, we need to do the square root and sample the SDF properly to
                 // get correct antialiasing
-                const sd = @sqrt(sd2) - r;
+                const sd = @sqrt(sd2) - radius;
                 if (left == left_unclamped) self.fillSdf(
                     row_start + left,
                     sd,
@@ -418,20 +418,21 @@ pub const Image = struct {
     pub fn drawCircle(
         self: @This(),
         center: x11.XY(i16),
-        radius: u8,
+        radius: f32,
         stroke_size: f32,
         color: Color,
     ) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const half_stroke = stroke_size / 2;
-        const half_stroke_ceil: i16 = @intFromFloat(@ceil(half_stroke));
+        const half_stroke_ceil: i16 = posIntFromFloat(i16, @ceil(half_stroke));
+        const radius_ceil = posIntFromFloat(i16, @ceil(radius));
         const min: x11.XY(u32) = .{
-            .x = clamp(@min(center.x, center.x) - radius - half_stroke_ceil, 0, self.size.x),
-            .y = clamp(@min(center.y, center.y) - radius - half_stroke_ceil, 0, self.size.y),
+            .x = clamp(@min(center.x, center.x) - radius_ceil - half_stroke_ceil, 0, self.size.x),
+            .y = clamp(@min(center.y, center.y) - radius_ceil - half_stroke_ceil, 0, self.size.y),
         };
         const max: x11.XY(u32) = .{
-            .x = clamp(@max(center.x, center.x) + radius + half_stroke_ceil, 0, self.size.x),
-            .y = clamp(@max(center.y, center.y) + radius + half_stroke_ceil, 0, self.size.y),
+            .x = clamp(@max(center.x, center.x) + radius_ceil + half_stroke_ceil, 0, self.size.x),
+            .y = clamp(@max(center.y, center.y) + radius_ceil + half_stroke_ceil, 0, self.size.y),
         };
         if (min.x == max.x or min.y == max.y) return;
 
@@ -439,9 +440,8 @@ pub const Image = struct {
         const mid_x: f32 = @floatFromInt(center.x);
         const mid_y: f32 = @floatFromInt(center.y);
 
-        const r_raw: f32 = @floatFromInt(radius);
-        const r_outer = r_raw + half_stroke;
-        const r_inner = r_raw - half_stroke;
+        const r_outer = radius + half_stroke;
+        const r_inner = radius - half_stroke;
         const r_outer2 = r_outer * r_outer;
         const r_early_out: f32 = r_inner - 0.5;
         const r_early_out2 = r_early_out * r_early_out;
@@ -456,7 +456,7 @@ pub const Image = struct {
             const dy2 = dy * dy;
             const row_start = self.size.x * y;
 
-            const scanline_width: i64 = @intFromFloat(@ceil(@sqrt(@abs(r_outer2 - dy2))));
+            const scanline_width = posIntFromFloat(i64, @ceil(@sqrt(@abs(r_outer2 - dy2))));
             var left_unclamped: i64 = @as(i64, @intCast(center.x)) - scanline_width;
             if (left_unclamped >= self.size.x) continue;
 
@@ -499,17 +499,18 @@ pub const Image = struct {
         self: @This(),
         start: x11.XY(i16),
         end: x11.XY(i16),
-        radius: u8,
+        radius: f32,
         color: Color,
     ) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
+        const radius_ceil = posIntFromFloat(i16, @ceil(radius));
         const min: x11.XY(u32) = .{
-            .x = clamp(@min(start.x, end.x) - radius, 0, self.size.x),
-            .y = clamp(@min(start.y, end.y) - radius, 0, self.size.y),
+            .x = clamp(@min(start.x, end.x) - radius_ceil, 0, self.size.x),
+            .y = clamp(@min(start.y, end.y) - radius_ceil, 0, self.size.y),
         };
         const max: x11.XY(u32) = .{
-            .x = clamp(@max(start.x, end.x) + radius, 0, self.size.x),
-            .y = clamp(@max(start.y, end.y) + radius, 0, self.size.y),
+            .x = clamp(@max(start.x, end.x) + radius_ceil, 0, self.size.x),
+            .y = clamp(@max(start.y, end.y) + radius_ceil, 0, self.size.y),
         };
         if (min.x == max.x or min.y == max.y) return;
 
@@ -519,10 +520,9 @@ pub const Image = struct {
         const a_y: f32 = @floatFromInt(start.y);
         const b_y: f32 = @floatFromInt(end.y);
 
-        const r: f32 = @floatFromInt(radius);
-        const r_early_out: f32 = r + 0.5;
+        const r_early_out: f32 = radius + 0.5;
         const r_early_out2 = r_early_out * r_early_out;
-        const r_early_in: f32 = r - 0.5;
+        const r_early_in: f32 = radius - 0.5;
         const r_early_in2 = r_early_in * r_early_in;
 
         const color_p = color.premul();
@@ -562,7 +562,7 @@ pub const Image = struct {
 
                 // We're on the edge, we need to do the square root and sample the SDF properly to
                 // get correct antialiasing
-                const sd = @sqrt(sd2) - r;
+                const sd = @sqrt(sd2) - radius;
                 self.fillSdf(
                     row_start + x,
                     sd,
@@ -633,6 +633,13 @@ pub const Image = struct {
 
     fn floatToUnorm(f: f32) u8 {
         return @intFromFloat(f * math.maxInt(u8) + 0.5);
+    }
+
+    fn posIntFromFloat(T: type, f: f32) T {
+        if (std.math.isNan(f)) return 0;
+        if (f > @as(f32, @floatFromInt(std.math.maxInt(T)))) return std.math.maxInt(T);
+        if (f < 0) return 0;
+        return @intFromFloat(f);
     }
 
     pub fn bytes(self: @This()) []u8 {
@@ -1023,26 +1030,26 @@ const Entity = struct {
         },
         fill_rounded_rect: struct {
             extent: x11.Rectangle,
-            radius: u32,
+            radius: f32,
             color: Image.Color,
         },
         draw_rounded_rect: struct {
             extent: x11.Rectangle,
-            radius: u32,
+            radius: f32,
             stroke_size: f32,
             color: Image.Color,
         },
         fill_circle: struct {
-            radius: u8,
+            radius: f32,
             color: Image.Color,
         },
         draw_circle: struct {
-            radius: u8,
+            radius: f32,
             color: Image.Color,
             stroke_size: f32,
         },
         /// Must be followed by `line_end`.
-        line_start: struct { radius: u8, color: Image.Color },
+        line_start: struct { radius: f32, color: Image.Color },
         /// Must come after `line_start`.
         line_end: void,
         sprite: struct { image: Image, opacity: u8 },
@@ -1061,7 +1068,7 @@ const Entity = struct {
                 .height = rect.extent.height,
             },
             .draw_rounded_rect => |rect| {
-                const stroke_size: i16 = @intFromFloat(@ceil(rect.stroke_size));
+                const stroke_size = Image.posIntFromFloat(i16, @ceil(rect.stroke_size));
                 return .{
                     .x = entity.origin.x + rect.extent.x - stroke_size,
                     .y = entity.origin.y + rect.extent.y - stroke_size,
@@ -1069,24 +1076,28 @@ const Entity = struct {
                     .height = rect.extent.height + @as(u16, @intCast(stroke_size)),
                 };
             },
-            .fill_circle => |circle| return .{
-                .x = entity.origin.x - @as(i16, @intCast(circle.radius)),
-                .y = entity.origin.y - @as(i16, @intCast(circle.radius)),
-                .width = @as(u16, @intCast(circle.radius)) * 2,
-                .height = @as(u16, @intCast(circle.radius)) * 2,
+            .fill_circle => |circle| {
+                const radius = Image.posIntFromFloat(i16, @ceil(circle.radius));
+                const double_radius = Image.posIntFromFloat(u16, @ceil(circle.radius * 2));
+                return .{
+                    .x = entity.origin.x - radius,
+                    .y = entity.origin.y - radius,
+                    .width = double_radius,
+                    .height = double_radius,
+                };
             },
             .draw_circle => |circle| {
-                const r: i16 = @intFromFloat(@ceil(@as(f32, @floatFromInt(circle.radius)) + circle.stroke_size / 2));
+                const radius = Image.posIntFromFloat(i16, @ceil(circle.radius + circle.stroke_size / 2));
                 return .{
-                    .x = entity.origin.x - r,
-                    .y = entity.origin.y - r,
-                    .width = @as(u16, @intCast(r)) * 2,
-                    .height = @as(u16, @intCast(r)) * 2,
+                    .x = entity.origin.x - radius,
+                    .y = entity.origin.y - radius,
+                    .width = @intCast(2 * radius),
+                    .height = @intCast(2 * radius),
                 };
             },
             .line_start => |line_start| {
-                const rn = -@as(i16, line_start.radius);
-                const r2 = @as(u16, line_start.radius) * 2;
+                const rn = -@as(i16, Image.posIntFromFloat(i16, @ceil(line_start.radius)));
+                const r2 = @as(u16, Image.posIntFromFloat(u16, @ceil(line_start.radius * 2)));
                 return .{
                     .x = entity.origin.x + rn,
                     .y = entity.origin.y + rn,
@@ -1104,10 +1115,12 @@ const Entity = struct {
                 if (index == 0) return result;
                 const prev = entities[index - 1];
                 if (prev.shape != .line_start) return result;
-                result.x -= prev.shape.line_start.radius;
-                result.y -= prev.shape.line_start.radius;
-                result.width = prev.shape.line_start.radius * 2;
-                result.height = prev.shape.line_start.radius * 2;
+                const r_ceil = Image.posIntFromFloat(i16, @ceil(prev.shape.line_start.radius));
+                const r_ceil_double = Image.posIntFromFloat(u16, @ceil(prev.shape.line_start.radius * 2));
+                result.x -= r_ceil;
+                result.y -= r_ceil;
+                result.width = r_ceil_double;
+                result.height = r_ceil_double;
                 return result;
             },
             .sprite => |sprite| return .{
