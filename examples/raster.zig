@@ -1,14 +1,5 @@
 // XXX:
-// * blending
-//     [ ] we shouldn't earlyu out on alpha alone since we could be using additive colors, right now
-//     they don't work in many shapes because of this
-// * rects
-//     [ ] switch to extents, decide if input should be floats first though
-// * get circles right
-//     [ ] make sure 1px circle is on right point
-// * lines
-//     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
-//     [ ] fill considered pixels with black to test
+// [ ] make sure 1px circle is on right point
 // [ ] get tests running, maybe disable slow tests by default
 // [ ] research cpus/muladd
 
@@ -46,6 +37,13 @@ pub const Image = struct {
             /// Shorthand to initialize a premultiplied color from an unassociated color.
             pub fn init(color: Color) Pm {
                 return color.premul();
+            }
+
+            /// Shorthand to initialize a premultiplied additive color from an unassociated color.
+            pub fn initAdditive(color: Color) Pm {
+                var result = color.premul();
+                result.a = 0;
+                return result;
             }
 
             /// Efficiently blends source onto destination, emulating the alpha blending you'd get
@@ -298,10 +296,9 @@ pub const Image = struct {
     ) void {
         const half_stroke = stroke_size / 2;
         const half_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(half_stroke));
-        const radius_minus_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(radius - stroke_size));
-        const radius_plus_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(radius + stroke_size));
-        const height_minus_radius_plus_stroke_ceil: i64 = rect.height -| radius_plus_stroke_ceil;
-        const width_minus_radius_plus_stroke_ceil: i64 = rect.width -| radius_plus_stroke_ceil;
+        const radius_ceil: i64 = posIntFromFloat(i64, @ceil(radius));
+        const height_minus_half_stroke_ceil: i64 = rect.height -| half_stroke_ceil;
+        const width_minus_radius_plus_stroke_ceil: i64 = rect.width -| radius_ceil;
 
         // Clamp the bounds to the render target
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x) - half_stroke_ceil, 0, self.size.x));
@@ -334,9 +331,9 @@ pub const Image = struct {
                 const x: f32 = pixelCenter(x_i);
 
                 // If we're in the interior rect, skip it to avoid the square root
-                if (@as(i64, @intCast(x_i)) - rect.x >= radius_minus_stroke_ceil and
-                    @as(i64, @intCast(y_i)) - rect.y >= radius_minus_stroke_ceil and
-                    @as(i64, @intCast(y_i)) - rect.y <= height_minus_radius_plus_stroke_ceil)
+                if (@as(i64, @intCast(x_i)) - rect.x >= radius_ceil and
+                    @as(i64, @intCast(y_i)) - rect.y >= half_stroke_ceil and
+                    @as(i64, @intCast(y_i)) - rect.y < height_minus_half_stroke_ceil)
                 {
                     const skip_to_unclamped = @as(i64, rect.x) + width_minus_radius_plus_stroke_ceil;
                     const skip_to: i64 = @intCast(@min(skip_to_unclamped, self.size.x));
