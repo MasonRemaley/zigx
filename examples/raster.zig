@@ -7,8 +7,6 @@
 //     [ ] aabb is overbroad, we can probably bound each scanline much more tightly
 //     [ ] fill considered pixels with black to test
 // [ ] get tests running, maybe disable slow tests by default
-// [ ] profile, compare to precomputing blends, compare to f32 version
-//     [ ] vectorize/bin?
 // [ ] research cpus/muladd
 
 const timer_period_ns = 16 * std.time.ns_per_ms;
@@ -530,13 +528,46 @@ pub const Image = struct {
         const ba_y = b_y - a_y;
         const ba_ba_y = ba_y * ba_y;
 
+        const dy = b_y - a_y;
+        const dx = b_x - a_x;
+        const dxdy = dx / dy;
+        const dydx = dy / dx;
+
+        const aa_margin = 1;
+        const offset = radius * @sqrt(dydx * dydx + 1) + aa_margin;
+        const a_y_offset_pos = a_y + offset;
+        const a_y_offset_neg = a_y - offset;
+
         for (min.y..max.y) |y| {
             const pa_y = pixelCenter(y) - a_y;
             const pa_ba_y = pa_y * ba_y;
 
             const row_start = self.size.x * y;
 
-            for (min.x..max.x) |x| {
+            const y_f: f32 = @floatFromInt(y);
+
+            const scanline_start, const scanline_end = b: {
+                if (std.math.isInf(dydx)) {
+                    break :b .{ min.x, max.x };
+                }
+
+                const intersection_0 = dxdy * (y_f - a_y_offset_pos) + a_x;
+                const intersection_1 = dxdy * (y_f - a_y_offset_neg) + a_x;
+                const scanline_start: usize = @intFromFloat(std.math.clamp(
+                    @floor(@min(intersection_0, intersection_1)),
+                    @as(f32, @floatFromInt(min.x)),
+                    @as(f32, @floatFromInt(max.x)),
+                ));
+                const scanline_end: usize = @intFromFloat(std.math.clamp(
+                    @ceil(@max(intersection_0, intersection_1)),
+                    @as(f32, @floatFromInt(min.x)),
+                    @as(f32, @floatFromInt(max.x)),
+                ));
+
+                break :b .{ scanline_start, scanline_end };
+            };
+
+            for (scanline_start..scanline_end) |x| {
                 const pa_x = pixelCenter(x) - a_x;
                 const ba_x = b_x - a_x;
 
@@ -919,16 +950,18 @@ pub fn main() !void {
         .velocity = .{ .x = 3, .y = 3 },
     });
     try entities.appendBounded(.{
-        .shape = .{ .line_start = .{
-            .radius = 10,
-            .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
-        } },
+        .shape = .{
+            .line_start = .{
+                .radius = 10,
+                .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
+            },
+        },
         .origin = .{ .x = 50, .y = 50 },
         .velocity = .{ .x = 2, .y = 3 },
     });
     try entities.appendBounded(.{
         .shape = .line_end,
-        .origin = .{ .x = 100, .y = 40 },
+        .origin = .{ .x = 150, .y = 10 },
         .velocity = .{ .x = 3, .y = 2 },
     });
     try entities.appendBounded(.{
@@ -1056,7 +1089,7 @@ const Entity = struct {
     };
     shape: Shape,
     origin: x11.XY(i16),
-    velocity: x11.XY(i16),
+    velocity: x11.XY(i16) = .zero,
 
     pub fn getAabb(entities: []const @This(), index: usize) x11.Rectangle {
         const entity = entities[index];
