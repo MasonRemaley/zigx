@@ -1,4 +1,7 @@
 // XXX:
+// * blending
+//     [ ] we shouldn't earlyu out on alpha alone since we could be using additive colors, right now
+//     they don't work in many shapes because of this
 // * rects
 //     [ ] switch to extents, decide if input should be floats first though
 // * get circles right
@@ -12,20 +15,38 @@
 const timer_period_ns = 16 * std.time.ns_per_ms;
 
 pub const Image = struct {
-    buf: []Color.Premultiplied,
+    buf: []Color.Pm,
     size: XY(u32),
 
+    /// A sRGB color. This is is the format you will get out of most color pickers, useful for human
+    /// input. As such, alpha is straight/unassociated.
     const Color = packed struct(u32) {
         b: u8,
         g: u8,
         r: u8,
         a: u8,
 
-        pub const Premultiplied = packed struct(u32) {
-            b: u8,
-            g: u8,
-            r: u8,
+        pub const white: Color = .{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 0xff };
+        pub const black: Color = .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff };
+        pub const transparent: Color = .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0x00 };
+
+        /// A sRGB color with an associated alpha channel, also known as Pre-Multiplied alpha. It's
+        /// faster to operate on these internally, and they're more flexible since additive colors
+        /// can be created by zeroing out the alpha channel.
+        pub const Pm = packed struct(u32) {
+            b_pm: u8,
+            g_pm: u8,
+            r_pm: u8,
             a: u8,
+
+            pub const white: Pm = .{ .r_pm = 0xff, .g_pm = 0xff, .b_pm = 0xff, .a = 0xff };
+            pub const black: Pm = .{ .r_pm = 0x00, .g_pm = 0x00, .b_pm = 0x00, .a = 0xff };
+            pub const transparent: Pm = .{ .r_pm = 0x00, .g_pm = 0x00, .b_pm = 0x00, .a = 0x00 };
+
+            /// Shorthand to initialize a premultiplied color from an unassociated color.
+            pub fn init(color: Color) Pm {
+                return color.premul();
+            }
 
             /// Efficiently blends source onto destination, emulating the alpha blending you'd get
             /// from alpha blending on a GPU. For best performance, you should cache the
@@ -37,15 +58,14 @@ pub const Image = struct {
             /// doing sRGB correction before you call this method.
             pub fn blend(dst: @This(), src: @This()) @This() {
                 const dst_scaled = dst.scale(0xff - src.a);
-                // Saturating addition is used because additive blending can overflow. Typical
-                // colors are blended normally, but you can create additive colors under
-                // premultiplied alpha by setting the alpha to 0 without 0ing out the colors.
-                // Additive blending can overflow, clamping on overflow matches the behavior you'd
-                // get out of a GPU.
+                // Saturating addition is used because additive blending can overflow (e.g. colors
+                // with zeroed out alpha channels.) Clamping may not produce the best perceptual
+                // results, but the goal is to match the output of a GPU. There are fancier
+                // alternatives but they are opinionnated and slower.
                 return .{
-                    .r = src.r +| dst_scaled.r,
-                    .g = src.g +| dst_scaled.g,
-                    .b = src.b +| dst_scaled.b,
+                    .r_pm = src.r_pm +| dst_scaled.r_pm,
+                    .g_pm = src.g_pm +| dst_scaled.g_pm,
+                    .b_pm = src.b_pm +| dst_scaled.b_pm,
                     .a = src.a +| dst_scaled.a,
                 };
             }
@@ -123,15 +143,15 @@ pub const Image = struct {
         };
 
         /// Efficiently scales the color channels by the alpha channel.
-        pub fn premul(self: Color) Premultiplied {
-            var result: Color.Premultiplied = @bitCast(self);
+        pub fn premul(self: Color) Pm {
+            var result: Color.Pm = @bitCast(self);
             result.a = 0xff;
             return result.scale(self.a);
         }
 
         /// Equivalent to `premul`, but internally computes the result using floating point. This is
         /// slow, used only as a test oracle.
-        fn premulF32(self: Color) Premultiplied {
+        fn premulF32(self: Color) Pm {
             var bgr = self;
             bgr.a = 0xff;
             return @bitCast(bgr.scaleF32(self.a));
@@ -174,7 +194,7 @@ pub const Image = struct {
 
     pub fn init(gpa: Allocator, size: XY(u32)) !@This() {
         return .{
-            .buf = try gpa.alloc(Color.Premultiplied, @as(usize, size.x) * @as(usize, size.y)),
+            .buf = try gpa.alloc(Color.Pm, @as(usize, size.x) * @as(usize, size.y)),
             .size = size,
         };
     }
@@ -184,11 +204,11 @@ pub const Image = struct {
         self.* = undefined;
     }
 
-    pub fn clear(self: @This(), color: Color.Premultiplied) void {
+    pub fn clear(self: @This(), color: Color.Pm) void {
         @memset(self.buf, color);
     }
 
-    pub fn fillRect(self: @This(), rect: x11.Rectangle, color: Color) void {
+    pub fn fillRect(self: @This(), rect: x11.Rectangle, color: Color.Pm) void {
         // Clamp the bounds to the render target
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
         const x_max: u32 = @intCast(clamp(@as(i64, rect.x) + rect.width, 0, self.size.x));
@@ -197,17 +217,19 @@ pub const Image = struct {
 
         const width = x_max - x_min;
 
-        // Premultiply the color
-        const color_p = color.premul();
-
         // Fill the rect
         for (y_min..y_max) |y| {
-            fill(self.buf[self.size.x * y + x_min ..][0..width], color_p);
+            fill(self.buf[self.size.x * y + x_min ..][0..width], color);
         }
     }
 
     /// Renders a rounded rectangle.
-    pub fn fillRoundedRect(self: @This(), rect: x11.Rectangle, radius: f32, color: Color) void {
+    pub fn fillRoundedRect(
+        self: @This(),
+        rect: x11.Rectangle,
+        radius: f32,
+        color: Color.Pm,
+    ) void {
         // Clamp the bounds to the render target
         const radius_ceil = posIntFromFloat(i64, @ceil(radius));
         const x_min: u32 = @intCast(clamp(@as(i64, rect.x), 0, self.size.x));
@@ -222,9 +244,6 @@ pub const Image = struct {
         const half_height = height / 2;
         const left: f32 = @floatFromInt(rect.x);
         const bottom: f32 = @floatFromInt(rect.y);
-
-        // Premultiply the color
-        const color_p = color.premul();
 
         // Fill the rounded rect. We could do 1/4th as many square roots by taking advantage of the
         // four way symmetry, but we opted not do as this complicates clipping and jumps around in
@@ -248,7 +267,7 @@ pub const Image = struct {
                     const skip_to: i64 = @intCast(@min(skip_to_unclamped, self.size.x));
                     if (x_i < skip_to) {
                         const skip_to_u: u32 = @intCast(skip_to);
-                        fill(self.buf[row_start + x_i ..][0 .. skip_to_u - x_i], color_p);
+                        fill(self.buf[row_start + x_i ..][0 .. skip_to_u - x_i], color);
                         x_i = skip_to_u;
                         if (x_i >= x_max) break;
                     }
@@ -264,7 +283,7 @@ pub const Image = struct {
 
                 const sd = @min(@max(q_x, q_y), 0) + q_max_len - radius;
 
-                self.fillSdf(row_start + x_i, sd, color_p);
+                self.fillSdf(row_start + x_i, sd, color);
             }
         }
     }
@@ -275,7 +294,7 @@ pub const Image = struct {
         rect: x11.Rectangle,
         radius: f32,
         stroke_size: f32,
-        color: Color,
+        color: Color.Pm,
     ) void {
         const half_stroke = stroke_size / 2;
         const half_stroke_ceil: i64 = posIntFromFloat(i64, @ceil(half_stroke));
@@ -297,9 +316,6 @@ pub const Image = struct {
         const half_height = height / 2;
         const left: f32 = @floatFromInt(rect.x);
         const bottom: f32 = @floatFromInt(rect.y);
-
-        // Premultiply the color
-        const color_p = color.premul();
 
         // Fill the rounded rect. We could do 1/4th as many square roots by taking advantage of the
         // four way symmetry, but we opted not do as this complicates clipping and jumps around in
@@ -342,12 +358,17 @@ pub const Image = struct {
                 const sd_fill = @min(@max(q_x, q_y), 0) + q_max_len - radius;
                 const sd = subtractSdf(sd_fill + half_stroke, sd_fill - half_stroke);
 
-                self.fillSdf(row_start + x_i, sd, color_p);
+                self.fillSdf(row_start + x_i, sd, color);
             }
         }
     }
 
-    pub fn fillCircle(self: @This(), center: x11.XY(i16), radius: f32, color: Color) void {
+    pub fn fillCircle(
+        self: @This(),
+        center: x11.XY(i16),
+        radius: f32,
+        color: Color.Pm,
+    ) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const radius_ceil = posIntFromFloat(i16, @ceil(radius));
         const min: x11.XY(u32) = .{
@@ -367,8 +388,6 @@ pub const Image = struct {
         const r2 = radius * radius;
         const r_early_in: f32 = radius - 0.5;
         const r_early_in2 = r_early_in * r_early_in;
-
-        const color_p = color.premul();
 
         // Evaluate the SDF. We take advtange of horizontal symmetry here, but not vertical
         // symmetry. At the cost of jumping around in memory more and increased clipping complexity,
@@ -397,7 +416,7 @@ pub const Image = struct {
                 // If we're fully inside the shape, fill the rest of the scanline without
                 // antialiasing.
                 if (sd2 < r_early_in2) {
-                    fill(self.buf[row_start + left .. row_start + right], color_p);
+                    fill(self.buf[row_start + left .. row_start + right], color);
                     break;
                 }
 
@@ -407,12 +426,12 @@ pub const Image = struct {
                 if (left == left_unclamped) self.fillSdf(
                     row_start + left,
                     sd,
-                    color_p,
+                    color,
                 );
                 if (right == right_unclamped and right > 1) self.fillSdf(
                     (row_start + right) - 1,
                     sd,
-                    color_p,
+                    color,
                 );
             }
         }
@@ -423,7 +442,7 @@ pub const Image = struct {
         center: x11.XY(i16),
         radius: f32,
         stroke_size: f32,
-        color: Color,
+        color: Color.Pm,
     ) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const half_stroke = stroke_size / 2;
@@ -448,8 +467,6 @@ pub const Image = struct {
         const r_outer2 = r_outer * r_outer;
         const r_early_out: f32 = r_inner - 0.5;
         const r_early_out2 = r_early_out * r_early_out;
-
-        const color_p = color.premul();
 
         // Evaluate the SDF. We take advtange of horizontal symmetry here, but not vertical
         // symmetry. At the cost of jumping around in memory more and increased clipping complexity,
@@ -486,12 +503,12 @@ pub const Image = struct {
                 if (left == left_unclamped) self.fillSdf(
                     row_start + left,
                     sd,
-                    color_p,
+                    color,
                 );
                 if (right == right_unclamped and right > 1) self.fillSdf(
                     (row_start + right) - 1,
                     sd,
-                    color_p,
+                    color,
                 );
             }
         }
@@ -503,7 +520,7 @@ pub const Image = struct {
         start: x11.XY(i16),
         end: x11.XY(i16),
         radius: f32,
-        color: Color,
+        color: Color.Pm,
     ) void {
         // Calculate the AABB, factoring in the line radius and clipping. Early out if zero area.
         const radius_ceil = posIntFromFloat(i16, @ceil(radius));
@@ -527,8 +544,6 @@ pub const Image = struct {
         const r_early_out2 = r_early_out * r_early_out;
         const r_early_in: f32 = radius - 0.5;
         const r_early_in2 = r_early_in * r_early_in;
-
-        const color_p = color.premul();
 
         const ba_y = b_y - a_y;
         const ba_ba_y = ba_y * ba_y;
@@ -592,7 +607,7 @@ pub const Image = struct {
                 // avoid the square root
                 if (sd2 < r_early_in2) {
                     const sample = &self.buf[row_start + x];
-                    sample.* = sample.blendOrBlit(color_p);
+                    sample.* = sample.blendOrBlit(color);
                     continue;
                 }
 
@@ -602,7 +617,7 @@ pub const Image = struct {
                 self.fillSdf(
                     row_start + x,
                     sd,
-                    color_p,
+                    color,
                 );
             }
         }
@@ -634,7 +649,7 @@ pub const Image = struct {
 
     /// Fills the range of pixels using memset if possible, falling back to a for loop if alpha
     /// blending is required.
-    fn fill(slice: []Color.Premultiplied, color: Color.Premultiplied) void {
+    fn fill(slice: []Color.Pm, color: Color.Pm) void {
         if (color.a == 0xff) {
             @memset(slice, color);
         } else for (slice) |*sample| {
@@ -646,7 +661,7 @@ pub const Image = struct {
         return @max(-lhs, rhs);
     }
 
-    fn fillSdf(self: @This(), index: usize, sd: f32, color: Color.Premultiplied) void {
+    fn fillSdf(self: @This(), index: usize, sd: f32, color: Color.Pm) void {
         // If we're fully outside the shape, early out. Otherwise get the sample.
         if (sd > 0.5) return;
         const sample = &self.buf[index];
@@ -804,46 +819,41 @@ pub fn main() !void {
         .y = 64,
     });
     defer sprite.deinit(std.heap.page_allocator);
-    sprite.clear(.{
-        .r = 0x00,
-        .g = 0x00,
-        .b = 0x00,
-        .a = 0x00,
-    });
+    sprite.clear(.transparent);
     sprite.fillCircle(
         .{ .x = 32, .y = 10 },
         10,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+        .black,
     );
     sprite.drawLine(
         .{ .x = 32, .y = 10 },
         .{ .x = 32, .y = 40 },
         2,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+        .black,
     );
     sprite.drawLine(
         .{ .x = 20, .y = 59 },
         .{ .x = 32, .y = 40 },
         2,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+        .black,
     );
     sprite.drawLine(
         .{ .x = 64 - 20, .y = 59 },
         .{ .x = 32, .y = 40 },
         2,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+        .black,
     );
     sprite.drawLine(
         .{ .x = 20, .y = 35 },
         .{ .x = 32, .y = 20 },
         2,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+        .black,
     );
     sprite.drawLine(
         .{ .x = 64 - 20, .y = 35 },
         .{ .x = 32, .y = 20 },
         2,
-        .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+        .black,
     );
 
     var entity_buf: [16]Entity = undefined;
@@ -856,7 +866,7 @@ pub fn main() !void {
                 .width = 100,
                 .height = 100,
             },
-            .color = .{ .r = 0xff, .g = 0xaa, .b = 0x22, .a = 0xaa },
+            .color = .init(.{ .r = 0xff, .g = 0xaa, .b = 0x22, .a = 0xaa }),
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 2, .y = 1 },
@@ -869,7 +879,7 @@ pub fn main() !void {
                 .width = 100,
                 .height = 100,
             },
-            .color = .{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xee },
+            .color = .init(.{ .r = 0xff, .g = 0x00, .b = 0x00, .a = 0xee }),
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 3, .y = 4 },
@@ -883,7 +893,7 @@ pub fn main() !void {
                 .height = 100,
             },
             .radius = 20,
-            .color = .{ .r = 0xff, .g = 0xaa, .b = 0xaa, .a = 0xaa },
+            .color = .init(.{ .r = 0xff, .g = 0xaa, .b = 0xaa, .a = 0xaa }),
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 2, .y = 4 },
@@ -898,7 +908,7 @@ pub fn main() !void {
             },
             .radius = 20,
             .stroke_size = 10,
-            .color = .{ .r = 0xaa, .g = 0x00, .b = 0xaa, .a = 0xaa },
+            .color = .init(.{ .r = 0xaa, .g = 0x00, .b = 0xaa, .a = 0xaa }),
         } },
         .origin = .{ .x = 0, .y = 0 },
         .velocity = .{ .x = 2, .y = 3 },
@@ -906,7 +916,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .fill_circle = .{
             .radius = 50,
-            .color = .{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa },
+            .color = .init(.{ .r = 0x00, .g = 0xff, .b = 0xff, .a = 0xaa }),
         } },
         .origin = .{ .x = 10, .y = 10 },
         .velocity = .{ .x = -4, .y = 0 },
@@ -914,7 +924,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .fill_circle = .{
             .radius = 25,
-            .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
+            .color = .init(.{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa }),
         } },
         .origin = .{ .x = 20, .y = 10 },
         .velocity = .{ .x = 4, .y = -2 },
@@ -922,7 +932,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .fill_circle = .{
             .radius = 30,
-            .color = .{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa },
+            .color = .init(.{ .r = 0xff, .g = 0xff, .b = 0x00, .a = 0xaa }),
         } },
         .origin = .{ .x = 100, .y = 20 },
         .velocity = .{ .x = 3, .y = 2 },
@@ -930,7 +940,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .draw_circle = .{
             .radius = 50,
-            .color = .{ .r = 0x00, .g = 0xaa, .b = 0xaa, .a = 0xaa },
+            .color = .init(.{ .r = 0x00, .g = 0xaa, .b = 0xaa, .a = 0xaa }),
             .stroke_size = 2,
         } },
         .origin = .{ .x = 5, .y = 10 },
@@ -939,7 +949,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .draw_circle = .{
             .radius = 25,
-            .color = .{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa },
+            .color = .init(.{ .r = 0xff, .g = 0x00, .b = 0xff, .a = 0xaa }),
             .stroke_size = 10,
         } },
         .origin = .{ .x = 20, .y = 5 },
@@ -948,7 +958,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .draw_circle = .{
             .radius = 30,
-            .color = .{ .r = 0x00, .g = 0x00, .b = 0x00, .a = 0xff },
+            .color = .black,
             .stroke_size = 1,
         } },
         .origin = .{ .x = 100, .y = 20 },
@@ -958,7 +968,7 @@ pub fn main() !void {
         .shape = .{
             .line_start = .{
                 .radius = 10,
-                .color = .{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff },
+                .color = .init(.{ .r = 0x00, .g = 0xaa, .b = 0x00, .a = 0xff }),
             },
         },
         .origin = .{ .x = 50, .y = 50 },
@@ -972,7 +982,7 @@ pub fn main() !void {
     try entities.appendBounded(.{
         .shape = .{ .line_start = .{
             .radius = 5,
-            .color = .{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa },
+            .color = .init(.{ .r = 0x00, .g = 0x00, .b = 0xaa, .a = 0xaa }),
         } },
         .origin = .{ .x = 25, .y = 50 },
         .velocity = .{ .x = 4, .y = 3 },
@@ -1064,30 +1074,30 @@ const Entity = struct {
     const Shape = union(enum) {
         rect: struct {
             extent: x11.Rectangle,
-            color: Image.Color,
+            color: Image.Color.Pm,
         },
         fill_rounded_rect: struct {
             extent: x11.Rectangle,
             radius: f32,
-            color: Image.Color,
+            color: Image.Color.Pm,
         },
         draw_rounded_rect: struct {
             extent: x11.Rectangle,
             radius: f32,
             stroke_size: f32,
-            color: Image.Color,
+            color: Image.Color.Pm,
         },
         fill_circle: struct {
             radius: f32,
-            color: Image.Color,
+            color: Image.Color.Pm,
         },
         draw_circle: struct {
             radius: f32,
-            color: Image.Color,
+            color: Image.Color.Pm,
             stroke_size: f32,
         },
         /// Must be followed by `line_end`.
-        line_start: struct { radius: f32, color: Image.Color },
+        line_start: struct { radius: f32, color: Image.Color.Pm },
         /// Must come after `line_start`.
         line_end: void,
         sprite: struct { image: Image, opacity: u8 },
@@ -1268,7 +1278,7 @@ fn render(
     }
     const drawable: x11.Drawable = if (dbe.backBuffer()) |back_buffer| back_buffer else window.drawable();
 
-    rt.clear(.{ .r = 0xff, .g = 0xff, .b = 0xff, .a = 0xff });
+    rt.clear(.white);
 
     // Render a grid background
     {
@@ -1286,12 +1296,12 @@ fn render(
                         .width = cell_size,
                         .height = cell_size,
                     },
-                    .{
+                    .init(.{
                         .r = 0x00,
                         .g = 0x00,
                         .b = 0x00,
                         .a = 0x40,
-                    },
+                    }),
                 );
             }
         }
