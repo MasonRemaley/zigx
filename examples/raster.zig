@@ -37,11 +37,16 @@ pub const Image = struct {
             /// doing sRGB correction before you call this method.
             pub fn blend(dst: @This(), src: @This()) @This() {
                 const dst_scaled = dst.scale(0xff - src.a);
+                // Saturating addition is used because additive blending can overflow. Typical
+                // colors are blended normally, but you can create additive colors under
+                // premultiplied alpha by setting the alpha to 0 without 0ing out the colors.
+                // Additive blending can overflow, clamping on overflow matches the behavior you'd
+                // get out of a GPU.
                 return .{
-                    .r = src.r + dst_scaled.r,
-                    .g = src.g + dst_scaled.g,
-                    .b = src.b + dst_scaled.b,
-                    .a = src.a + dst_scaled.a,
+                    .r = src.r +| dst_scaled.r,
+                    .g = src.g +| dst_scaled.g,
+                    .b = src.b +| dst_scaled.b,
+                    .a = src.a +| dst_scaled.a,
                 };
             }
 
