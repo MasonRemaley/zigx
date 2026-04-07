@@ -3974,7 +3974,10 @@ pub const Setup = extern struct {
     unused2: u32,
 
     pub fn required(setup: *const Setup) u35 {
-        return @sizeOf(Setup) +|
+        // The first 8 bytes of Setup are the common reply header, which
+        // Source does not count in its word_count tracking. Use
+        // @sizeOf(Setup) - 8 to match what Source considers "taken".
+        return (@sizeOf(Setup) - 8) +|
             @as(u35, setup.vendor_len) +|
             @as(u35, pad4Len(@truncate(setup.vendor_len))) +|
             (@sizeOf(Format) *| @as(u35, setup.format_count)) +|

@@ -318,6 +318,55 @@ test "VisualType.findMatchingVisualType" {
     // try testing.expectError(error.VisualTypeNotFound, visual_type_not_found_result);
 }
 
+test "minimal setup reply (1 format, 1 screen, 1 depth, 1 visual)" {
+    // A minimal X server with just one format, one screen, one depth, one visual.
+    // This exercises the edge case where Setup.required() over-counts by 8
+    // because it includes @sizeOf(Setup) instead of @sizeOf(Setup) - 8.
+    const minimal_serialized = comptime std.mem.toBytes(x11.Format{
+        .depth = 24, .bits_per_pixel = 32, .scanline_pad = 32, ._ = .{ 0, 0, 0, 0, 0 },
+    }) ++ std.mem.toBytes(x11.ScreenHeader{
+        .root = @enumFromInt(1),
+        .colormap = @enumFromInt(2),
+        .white_pixel = 0x00ffffff,
+        .black_pixel = 0,
+        .input_masks = 0,
+        .pixel_width = 800,
+        .pixel_height = 600,
+        .mm_width = 200,
+        .mm_height = 150,
+        .min_installed_maps = 1,
+        .max_installed_maps = 1,
+        .root_visual = @enumFromInt(33),
+        .backing_stores = 0,
+        .save_unders = 0,
+        .root_depth = 24,
+        .allowed_depth_count = 1,
+    }) ++ std.mem.toBytes(x11.ScreenDepth{
+        .depth = 24, .unused0 = 0, .visual_type_count = 1, .unused1 = 0,
+    }) ++ std.mem.toBytes(x11.VisualType{
+        .id = @enumFromInt(33),
+        .class = @enumFromInt(@intFromEnum(x11.VisualType.Class.true_color)),
+        .bits_per_rgb_value = 8,
+        .colormap_entries = 256,
+        .red_mask = 0x00ff0000,
+        .green_mask = 0x0000ff00,
+        .blue_mask = 0x000000ff,
+        .unused = 0,
+    });
+
+    const buffer = setupReply(&minimal_serialized, .{
+        .vendor = "test",
+    }, .{
+        .root_screen_count = 1,
+        .format_count = 1,
+    });
+    var buffer_reader: std.Io.Reader = .fixed(&buffer);
+    const setup = try x11.readSetupSuccess(&buffer_reader);
+    var source: x11.Source = .initFinishSetup(&buffer_reader, &setup);
+
+    _ = try x11.draft.readSetupDynamic(&source, &setup, .{ .log_vendor = false });
+}
+
 fn takeXauthEntry(reader: *x11.AuthReader) error{ ReadFailed, EndOfStream }!?Auth {
     const family = (try reader.takeFamily()) orelse return null;
     const addr_len = try reader.takeDynamicLen(.addr);
