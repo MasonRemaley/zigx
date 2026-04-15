@@ -1,6 +1,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+const zig_atleast_16 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 16, .patch = 0 }) != .lt;
+
 /// Create the xtt (x11 true type) module with a custom TrueType module.
 pub fn createXtt(b: *std.Build, zigx_dep: *std.Build.Dependency, TrueType: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{
@@ -38,11 +40,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zigversion_mod = b.createModule(.{
+        .root_source_file = if (zig_atleast_16) b.path("src/atleast16.zig") else b.path("src/before16.zig"),
+    });
     // In almost all cases, Zig programs should only use this module, not the
     // library defined below, that's for C programs.
     const x_mod = b.addModule("x11", .{
         .root_source_file = b.path("src/x.zig"),
+        .imports = &.{
+            .{ .name = "zigversion", .module = zigversion_mod },
+        },
     });
+    if (!zig_atleast_16) {
+        if (b.lazyDependency("std16", .{})) |std16_dep| {
+            x_mod.addImport("std16", std16_dep.module("std16"));
+        }
+    }
 
     const true_type_mod = b.dependency("TrueType", .{}).module("TrueType");
     const xtt_mod = b.addModule("xtt", .{
@@ -59,8 +72,14 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/runall.zig"),
             .target = target,
             .optimize = .Debug,
+            .single_threaded = true,
         }),
     });
+    if (!zig_atleast_16) {
+        if (b.lazyDependency("std16", .{})) |std16_dep| {
+            examples_exe.root_module.addImport("std16", std16_dep.module("std16"));
+        }
+    }
     const run_examples = b.addRunArtifact(examples_exe);
 
     const test_step = b.step("test", "Run all tests and interactive examples)");
@@ -74,10 +93,17 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/" ++ example.name ++ ".zig"),
             .optimize = optimize,
             .target = target,
+            .single_threaded = true,
             .imports = &.{
                 .{ .name = "x11", .module = x_mod },
             },
         });
+        if (!zig_atleast_16) {
+            if (b.lazyDependency("std16", .{})) |std16_dep| {
+                example_mod.addImport("std16", std16_dep.module("std16"));
+            }
+        }
+
         if (example.needs_text) {
             example_mod.addImport("xtt", xtt_mod);
 
@@ -124,13 +150,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     x11_lib.root_module.addImport("x11", x_mod);
-    x11_lib.addIncludePath(b.path("c/include"));
+    x11_lib.root_module.addIncludePath(b.path("c/include"));
     x11_lib.installHeadersDirectory(
         b.path("c/include/X11"),
         "X11",
         .{},
     );
-    x11_lib.linkLibC();
+    x11_lib.root_module.link_libc = true;
     {
         const install = b.addInstallArtifact(x11_lib, .{});
         b.step("lib", "").dependOn(&install.step);
@@ -146,12 +172,12 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        exe.addCSourceFiles(.{
+        exe.root_module.addCSourceFiles(.{
             .files = &.{"c/example/hellox11.c"},
         });
-        exe.addIncludePath(b.path("include"));
-        exe.linkLibC();
-        exe.linkLibrary(x11_lib);
+        exe.root_module.addIncludePath(b.path("include"));
+        exe.root_module.link_libc = true;
+        exe.root_module.linkLibrary(x11_lib);
 
         const install = b.addInstallArtifact(exe, .{});
         b.step("install-hellox11b", "").dependOn(&install.step);
@@ -176,7 +202,16 @@ pub fn build(b: *std.Build) void {
         const x_mod_with_target = b.createModule(.{
             .root_source_file = b.path("src/x.zig"),
             .target = target,
+            .imports = &.{
+                .{ .name = "zigversion", .module = zigversion_mod },
+            },
         });
+        if (!zig_atleast_16) {
+            if (b.lazyDependency("std16", .{})) |std16_dep| {
+                x_mod_with_target.addImport("std16", std16_dep.module("std16"));
+            }
+        }
+
         const unit_tests = b.addTest(.{
             .root_module = x_mod_with_target,
         });
@@ -191,11 +226,17 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/xauth.zig"),
                 .target = target,
                 .optimize = optimize,
+                .single_threaded = true,
                 .imports = &.{
                     .{ .name = "x11", .module = x_mod },
                 },
             }),
         });
+        if (!zig_atleast_16) {
+            if (b.lazyDependency("std16", .{})) |std16_dep| {
+                xauth_exe.root_module.addImport("std16", std16_dep.module("std16"));
+            }
+        }
         const install = b.addInstallArtifact(xauth_exe, .{});
         b.step("install-xauth", "").dependOn(&install.step);
         test_non_interactive.dependOn(&install.step);
