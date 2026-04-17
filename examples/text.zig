@@ -119,54 +119,10 @@ fn run(
     arena_instance: *std.heap.ArenaAllocator,
     opt: Options,
 ) error{ WriteFailed, ReadFailed, EndOfStream, Protocol, UnexpectedMessage }!void {
-    var window_size: XY(u16) = .{ .x = 600, .y = 700 };
-
-    try sink.CreateWindow(
-        .{
-            .window_id = ids.window(),
-            .parent_window_id = root.window,
-            .depth = 0,
-            .x = 0,
-            .y = 0,
-            .width = window_size.x,
-            .height = window_size.y,
-            .border_width = 0,
-            .class = .input_output,
-            .visual_id = root.visual,
-        },
-        .{
-            .bg_pixel = root.depth.rgbFrom24(0),
-            .event_mask = .{
-                .ButtonPress = 1,
-                .ButtonRelease = 1,
-                .PointerMotion = 1,
-                .Exposure = 1,
-                .StructureNotify = 1,
-            },
-        },
-    );
-
-    try sink.CreateGc(
-        ids.gc(),
-        ids.window().drawable(),
-        .{
-            .background = root.depth.rgbFrom24(0),
-            .foreground = root.depth.rgbFrom24(0xffffff),
-            .line_width = 4,
-        },
-    );
     const present_ext = try x11.draft.synchronousQueryExtension(source, sink, x11.present.name) orelse {
         std.log.err("Present extension not available", .{});
         std.process.exit(0xff);
     };
-
-    try x11.present.selectInput(
-        sink,
-        present_ext.opcode_base,
-        ids.presentEventId(),
-        ids.window(),
-        .{ .complete_notify = true },
-    );
 
     const render_ext = try x11.draft.synchronousQueryExtension(source, sink, x11.render.name) orelse {
         std.log.err("RENDER extension not available", .{});
@@ -220,6 +176,51 @@ fn run(
             },
         };
     };
+
+    var window_size: XY(u16) = .{ .x = 600, .y = 700 };
+
+    try sink.CreateWindow(
+        .{
+            .window_id = ids.window(),
+            .parent_window_id = root.window,
+            .depth = 0,
+            .x = 0,
+            .y = 0,
+            .width = window_size.x,
+            .height = window_size.y,
+            .border_width = 0,
+            .class = .input_output,
+            .visual_id = root.visual,
+        },
+        .{
+            .bg_pixel = root.depth.rgbFrom24(0),
+            .event_mask = .{
+                .ButtonPress = 1,
+                .ButtonRelease = 1,
+                .PointerMotion = 1,
+                .Exposure = 1,
+                .StructureNotify = 1,
+            },
+        },
+    );
+
+    try sink.CreateGc(
+        ids.gc(),
+        ids.window().drawable(),
+        .{
+            .background = root.depth.rgbFrom24(0),
+            .foreground = root.depth.rgbFrom24(0xffffff),
+            .line_width = 4,
+        },
+    );
+
+    try x11.present.selectInput(
+        sink,
+        present_ext.opcode_base,
+        ids.presentEventId(),
+        ids.window(),
+        .{ .complete_notify = true },
+    );
 
     try x11.render.createPixmapPicture(
         sink,
