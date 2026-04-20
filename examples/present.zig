@@ -166,7 +166,7 @@ fn run(
         present_ext.opcode_base,
         ids.presentEventId(),
         ids.window(),
-        .{ .complete_notify = true },
+        .{ .idle_notify = true },
     );
 
     var window_width: u16 = initial_window_width;
@@ -203,11 +203,11 @@ fn run(
             .KeyRelease => _ = try source.read2(.KeyRelease),
             .GenericEvent => {
                 const event = try source.read2(.GenericEvent);
-                if (event.isPresentCompleteNotify(present_ext.opcode_base)) {
-                    const complete = try source.read3Full(.present_CompleteNotify);
-                    std.debug.assert(complete.event_id == ids.presentEventId());
-                    std.debug.assert(complete.window == ids.window());
-                    if (complete.serial == present_serial) {
+                if (event.isPresentIdleNotify(present_ext.opcode_base)) {
+                    const idle = try source.read3Full(.present_IdleNotify);
+                    std.debug.assert(idle.event_id == ids.presentEventId());
+                    std.debug.assert(idle.window == ids.window());
+                    if (idle.serial == present_serial) {
                         do_render = true;
                     }
                 } else std.debug.panic("unexpected GenericEvent {}", .{event});

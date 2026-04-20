@@ -5310,6 +5310,10 @@ pub const servermsg = struct {
             return event.ext_opcode_base == opcode_base and
                 event.type == @intFromEnum(present.EventType.complete_notify);
         }
+        pub fn isPresentIdleNotify(event: *const GenericEvent, opcode_base: u8) bool {
+            return event.ext_opcode_base == opcode_base and
+                event.type == @intFromEnum(present.EventType.idle_notify);
+        }
     };
 
     comptime {
@@ -5530,6 +5534,16 @@ pub const stage3 = struct {
         /// The vblank count at which the presentation occurred.
         media_stream_counter: u64 align(4),
     };
+    comptime {
+        std.debug.assert(@sizeOf(present_IdleNotify) == 20);
+    }
+    pub const present_IdleNotify = extern struct {
+        event_id: u32,
+        window: Window,
+        serial: u32,
+        pixmap: Pixmap,
+        idle_fence: u32,
+    };
 };
 
 pub const Read3Header = enum {
@@ -5559,6 +5573,7 @@ const Read3Full = enum {
     composite_QueryVersion,
     fixes_QueryVersion,
     present_CompleteNotify,
+    present_IdleNotify,
     pub fn Type(self: Read3Full) type {
         return switch (self) {
             inline else => |tag| @field(stage3, @tagName(tag)),
