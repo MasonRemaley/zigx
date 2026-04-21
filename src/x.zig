@@ -5824,3 +5824,100 @@ pub const PolyPointSink = struct {
         writeIntNoFlush(msg_sink.writer, i16, p.y);
     }
 };
+
+/// Tracks state needed for double-buffered vsync.
+pub const Presenter = struct {
+    opcode_base: u8,
+
+    depth: Depth,
+    window_id: Window,
+    event_id: u32,
+    pixmaps: [2]Pixmap,
+
+    serial: u32 = 0,
+    back_buf: u1 = 0,
+    pixmap_idle: [2]bool = .{ true, true },
+    presenting: bool = false,
+
+    /// Call once at startup after CreateWindow, before MapWindow.
+    pub fn init(p: *const Presenter, sink: *RequestSink, width: u16, height: u16) error{WriteFailed}!void {
+        try present.selectInput(sink, p.opcode_base, p.event_id, p.window_id, .{
+            .complete_notify = true,
+            .idle_notify = true,
+        });
+        for (p.pixmaps) |pixmap| {
+            try sink.CreatePixmap(pixmap, p.window_id.drawable(), .{
+                .depth = p.depth,
+                .width = width,
+                .height = height,
+            });
+        }
+    }
+
+    /// Call if the window size changes (from ConfigureNotify) to free/recreate
+    /// the pixmaps with the new size. Caller is responsible for only calling them
+    /// when the size has actually changed.
+    pub fn resize(p: *Presenter, sink: *RequestSink, width: u16, height: u16) error{WriteFailed}!void {
+        for (p.pixmaps) |pixmap| {
+            try sink.FreePixmap(pixmap);
+            try sink.CreatePixmap(pixmap, p.window_id.drawable(), .{
+                .depth = p.depth,
+                .width = width,
+                .height = height,
+            });
+        }
+        p.pixmap_idle = .{ true, true };
+        p.presenting = false;
+    }
+
+    /// Returns the back pixmap to render into if it's safe to do so, else null.
+    pub fn beginFrame(p: *const Presenter) ?Pixmap {
+        if (p.presenting) return null;
+        if (!p.pixmap_idle[p.back_buf]) return null;
+        return p.pixmaps[p.back_buf];
+    }
+    pub fn endFrame(p: *Presenter, sink: *RequestSink) error{WriteFailed}!void {
+        p.serial +%= 1;
+        try present.presentPixmap(
+            sink,
+            p.opcode_base,
+            p.window_id,
+            p.pixmaps[p.back_buf],
+            p.serial,
+            0,
+            0,
+            0,
+        );
+        p.pixmap_idle[p.back_buf] = false;
+        p.back_buf +%= 1;
+        p.presenting = true;
+    }
+
+    pub fn handleGenericEvent(
+        p: *Presenter,
+        source: *Source,
+        event: *const servermsg.GenericEvent,
+    ) error{ ReadFailed, EndOfStream }!bool {
+        if (event.isPresentCompleteNotify(p.opcode_base)) {
+            const complete = try source.read3Full(.present_CompleteNotify);
+            std.debug.assert(complete.event_id == p.event_id);
+            std.debug.assert(complete.window == p.window_id);
+            if (complete.serial == p.serial) {
+                p.presenting = false;
+            }
+            return true;
+        } else if (event.isPresentIdleNotify(p.opcode_base)) {
+            const idle = try source.read3Full(.present_IdleNotify);
+            std.debug.assert(idle.event_id == p.event_id);
+            std.debug.assert(idle.window == p.window_id);
+            if (idle.pixmap == p.pixmaps[0]) {
+                p.pixmap_idle[0] = true;
+            } else {
+                std.debug.assert(idle.pixmap == p.pixmaps[1]);
+                p.pixmap_idle[1] = true;
+            }
+            return true;
+        }
+        return false;
+    }
+};

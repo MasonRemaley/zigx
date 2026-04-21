@@ -1,8 +1,10 @@
 //! An example of using the "Present" extension for frame-synchronized animation.
-//! Renders into a Pixmap off-screen, then uses PresentPixmap to atomically
-//! display the frame. The server sends a CompleteNotify event when the frame
-//! has been displayed, which triggers the next frame — providing vsync-driven
-//! animation with no manual timers.
+//! Double-buffers between two pixmaps: while the compositor holds the front
+//! buffer, we render into the back buffer. PresentPixmap flips them. The frame
+//! loop is gated on two conditions: CompleteNotify (the previous frame has been
+//! presented — vsync) and IdleNotify (the back buffer has been released by the
+//! compositor and is safe to draw into). The initial render is kicked by the
+//! Expose event the server sends when the window first becomes visible.
 const initial_window_width = 800;
 const initial_window_height = 400;
 
@@ -14,13 +16,16 @@ const Ids = struct {
     pub fn gc(self: Ids) x11.GraphicsContext {
         return self.range.addAssumeCapacity(1).graphicsContext();
     }
-    pub fn pixmap(self: Ids) x11.Pixmap {
-        return self.range.addAssumeCapacity(2).pixmap();
+    pub fn presentPixmaps(self: Ids) [2]x11.Pixmap {
+        return .{
+            self.range.addAssumeCapacity(2).pixmap(),
+            self.range.addAssumeCapacity(3).pixmap(),
+        };
     }
     pub fn presentEventId(self: Ids) u32 {
-        return @intFromEnum(self.range.addAssumeCapacity(3));
+        return @intFromEnum(self.range.addAssumeCapacity(4));
     }
-    const needed_capacity = 4;
+    const needed_capacity = 5;
 };
 
 const Key = enum {
@@ -117,6 +122,10 @@ fn run(
             }
         }
     }
+    const present_ext = try x11.draft.synchronousQueryExtension(source, sink, x11.present.name) orelse {
+        std.log.err("Present extension not available", .{});
+        std.process.exit(0xff);
+    };
 
     try sink.CreateWindow(.{
         .window_id = ids.window(),
@@ -156,33 +165,22 @@ fn run(
         };
     };
 
-    const present_ext = try x11.draft.synchronousQueryExtension(source, sink, x11.present.name) orelse {
-        std.log.err("Present extension not available", .{});
-        std.process.exit(0xff);
-    };
-
-    try x11.present.selectInput(
-        sink,
-        present_ext.opcode_base,
-        ids.presentEventId(),
-        ids.window(),
-        .{ .idle_notify = true },
-    );
-
     var window_width: u16 = initial_window_width;
     var window_height: u16 = initial_window_height;
 
-    try sink.CreatePixmap(ids.pixmap(), ids.window().drawable(), .{
+    var presenter: x11.Presenter = .{
+        .opcode_base = present_ext.opcode_base,
         .depth = root.depth,
-        .width = window_width,
-        .height = window_height,
-    });
+        .window_id = ids.window(),
+        .event_id = ids.presentEventId(),
+        .pixmaps = ids.presentPixmaps(),
+    };
+    try presenter.init(sink, window_width, window_height);
 
     try sink.MapWindow(ids.window());
 
     var frame_time_graph: FrameTimeGraph = .{ .font_dims = font_dims };
-    var present_serial: u32 = 0;
-    var do_render = false;
+    var exposed = false;
 
     while (true) {
         try sink.writer.flush();
@@ -191,7 +189,7 @@ fn run(
         switch (msg_kind) {
             .Expose => {
                 _ = try source.read2(.Expose);
-                do_render = true;
+                exposed = true;
             },
             .KeyPress => {
                 const event = try source.read2(.KeyPress);
@@ -203,27 +201,17 @@ fn run(
             .KeyRelease => _ = try source.read2(.KeyRelease),
             .GenericEvent => {
                 const event = try source.read2(.GenericEvent);
-                if (event.isPresentIdleNotify(present_ext.opcode_base)) {
-                    const idle = try source.read3Full(.present_IdleNotify);
-                    std.debug.assert(idle.event_id == ids.presentEventId());
-                    std.debug.assert(idle.window == ids.window());
-                    if (idle.serial == present_serial) {
-                        do_render = true;
-                    }
-                } else std.debug.panic("unexpected GenericEvent {}", .{event});
+                if (!try presenter.handleGenericEvent(source, &event)) std.debug.panic(
+                    "unexpected {}",
+                    .{event},
+                );
             },
             .ConfigureNotify => {
                 const event = try source.read2(.ConfigureNotify);
                 if (event.width != window_width or event.height != window_height) {
                     window_width = event.width;
                     window_height = event.height;
-                    try writeFreeCreatePixmap(
-                        sink,
-                        ids,
-                        root.depth,
-                        window_width,
-                        window_height,
-                    );
+                    try presenter.resize(sink, window_width, window_height);
                 }
             },
             // StructureNotify events:
@@ -239,10 +227,9 @@ fn run(
             else => std.debug.panic("unexpected message {f}", .{source.readFmtDropError()}),
         }
 
-        if (do_render) {
-            present_serial +%= 1;
+        if (exposed) if (presenter.beginFrame()) |pixmap| {
             try sink.ChangeGc(ids.gc(), .{ .foreground = bg_rgb });
-            try sink.PolyFillRectangle(ids.pixmap().drawable(), ids.gc(), .initAssume(&.{.{
+            try sink.PolyFillRectangle(pixmap.drawable(), ids.gc(), .initAssume(&.{.{
                 .x = 0,
                 .y = 0,
                 .width = window_width,
@@ -250,7 +237,7 @@ fn run(
             }}));
             frame_time_graph.writeRender(
                 sink,
-                ids.pixmap().drawable(),
+                pixmap.drawable(),
                 ids.gc(),
                 window_width,
                 window_height,
@@ -258,34 +245,9 @@ fn run(
                 error.WriteFailed => return error.WriteFailed,
                 error.TextTooLong => @panic("todo: handle longer text"),
             };
-            try x11.present.presentPixmap(
-                sink,
-                present_ext.opcode_base,
-                ids.window(),
-                ids.pixmap(),
-                present_serial,
-                0,
-                0,
-                0,
-            );
-            do_render = false;
-        }
+            try presenter.endFrame(sink);
+        };
     }
-}
-
-fn writeFreeCreatePixmap(
-    sink: *x11.RequestSink,
-    ids: Ids,
-    depth: x11.Depth,
-    width: u16,
-    height: u16,
-) error{WriteFailed}!void {
-    try sink.FreePixmap(ids.pixmap());
-    try sink.CreatePixmap(ids.pixmap(), ids.window().drawable(), .{
-        .depth = depth,
-        .width = width,
-        .height = height,
-    });
 }
 
 const std = @import("std");

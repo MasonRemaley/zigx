@@ -9,13 +9,16 @@ const Ids = struct {
     pub fn gc(self: Ids) x11.GraphicsContext {
         return self.range.addAssumeCapacity(1).graphicsContext();
     }
-    pub fn pixmap(self: Ids) x11.Pixmap {
-        return self.range.addAssumeCapacity(2).pixmap();
+    pub fn presentPixmaps(self: Ids) [2]x11.Pixmap {
+        return .{
+            self.range.addAssumeCapacity(2).pixmap(),
+            self.range.addAssumeCapacity(3).pixmap(),
+        };
     }
     pub fn presentEventId(self: Ids) u32 {
-        return @intFromEnum(self.range.addAssumeCapacity(3));
+        return @intFromEnum(self.range.addAssumeCapacity(4));
     }
-    const needed_capacity = 4;
+    const needed_capacity = 5;
 };
 
 const Root = struct {
@@ -88,6 +91,15 @@ fn run(
 ) error{ WriteFailed, ReadFailed, EndOfStream, Protocol, UnexpectedMessage }!void {
     const keymap: x11.keymap.Full = try .initSynchronous(sink, source, keyrange);
 
+    const present_ext = try x11.draft.synchronousQueryExtension(
+        source,
+        sink,
+        x11.present.name,
+    ) orelse {
+        std.log.err("Present extension not available", .{});
+        std.process.exit(0xff);
+    };
+
     try sink.CreateWindow(.{
         .window_id = ids.window(),
         .parent_window_id = root.window,
@@ -113,28 +125,6 @@ fn run(
             .foreground = 0xaabbff,
         },
     );
-    const present_ext = try x11.draft.synchronousQueryExtension(
-        source,
-        sink,
-        x11.present.name,
-    ) orelse {
-        std.log.err("Present extension not available", .{});
-        std.process.exit(0xff);
-    };
-
-    try x11.present.selectInput(
-        sink,
-        present_ext.opcode_base,
-        ids.presentEventId(),
-        ids.window(),
-        .{ .complete_notify = true },
-    );
-
-    try sink.CreatePixmap(ids.pixmap(), ids.window().drawable(), .{
-        .depth = root.depth,
-        .width = window_width,
-        .height = window_height,
-    });
 
     const font_dims: FontDims = blk: {
         try sink.QueryTextExtents(ids.gc().fontable(), .initComptime(&[_]u16{'m'}));
@@ -149,12 +139,19 @@ fn run(
         };
     };
 
+    var presenter: x11.Presenter = .{
+        .opcode_base = present_ext.opcode_base,
+        .depth = root.depth,
+        .window_id = ids.window(),
+        .event_id = ids.presentEventId(),
+        .pixmaps = ids.presentPixmaps(),
+    };
+    try presenter.init(sink, window_width, window_height);
+
     try sink.MapWindow(ids.window());
 
     var key_log: x11.BoundedArray(KeyEvent, 80) = .{ .len = 0, .buffer = undefined };
     var key_log_next: usize = 0;
-    var present_serial: u32 = 0;
-    var render_in_flight = false;
     var dirty = false;
 
     while (true) {
@@ -188,33 +185,26 @@ fn run(
             },
             .GenericEvent => {
                 const event = try source.read2(.GenericEvent);
-                if (event.isPresentCompleteNotify(present_ext.opcode_base)) {
-                    const complete = try source.read3Full(.present_CompleteNotify);
-                    std.debug.assert(complete.event_id == ids.presentEventId());
-                    std.debug.assert(complete.window == ids.window());
-                    if (complete.serial == present_serial) {
-                        std.debug.assert(render_in_flight);
-                        render_in_flight = false;
-                    }
-                } else std.debug.panic("unexpected GenericEvent {}", .{event});
+                if (!try presenter.handleGenericEvent(source, &event)) std.debug.panic(
+                    "unexpected GenericEvent {}",
+                    .{event},
+                );
             },
             .MappingNotify => try source.discardRemaining(),
             else => std.debug.panic("unexpected X11 {f}", .{source.readFmtDropError()}),
         }
-        if (dirty and !render_in_flight) {
+        if (dirty) if (presenter.beginFrame()) |pixmap| {
             try render(
                 sink,
-                ids.pixmap(),
+                pixmap,
                 ids.gc(),
                 &font_dims,
                 key_log.slice(),
                 key_log_next,
             );
-            present_serial +%= 1;
-            try x11.present.presentPixmap(sink, present_ext.opcode_base, ids.window(), ids.pixmap(), present_serial, 0, 0, 0);
-            render_in_flight = true;
+            try presenter.endFrame(sink);
             dirty = false;
-        }
+        };
     }
 }
 

@@ -7,22 +7,28 @@ const Ids = struct {
     pub fn gc(self: Ids) x11.GraphicsContext {
         return self.range.addAssumeCapacity(1).graphicsContext();
     }
-    pub fn pixmap(self: Ids) x11.Pixmap {
-        return self.range.addAssumeCapacity(2).pixmap();
+    pub fn presentPixmaps(self: Ids) [2]x11.Pixmap {
+        return .{
+            self.range.addAssumeCapacity(2).pixmap(),
+            self.range.addAssumeCapacity(3).pixmap(),
+        };
     }
     pub fn presentEventId(self: Ids) u32 {
-        return @intFromEnum(self.range.addAssumeCapacity(3));
+        return @intFromEnum(self.range.addAssumeCapacity(4));
     }
     pub fn glyphset(self: Ids) x11.render.GlyphSet {
-        return self.range.addAssumeCapacity(4).glyphSet();
+        return self.range.addAssumeCapacity(5).glyphSet();
     }
-    pub fn dstPicture(self: Ids) x11.render.Picture {
-        return self.range.addAssumeCapacity(5).picture();
+    pub fn dstPictures(self: Ids) [2]x11.render.Picture {
+        return .{
+            self.range.addAssumeCapacity(6).picture(),
+            self.range.addAssumeCapacity(7).picture(),
+        };
     }
     pub fn srcPicture(self: Ids) x11.render.Picture {
-        return self.range.addAssumeCapacity(6).picture();
+        return self.range.addAssumeCapacity(8).picture();
     }
-    const needed_capacity = 7;
+    const needed_capacity = 9;
 };
 
 const Root = struct {
@@ -214,25 +220,19 @@ fn run(
         },
     );
 
-    try x11.present.selectInput(
-        sink,
-        present_ext.opcode_base,
-        ids.presentEventId(),
-        ids.window(),
-        .{ .complete_notify = true },
-    );
+    var presenter: x11.Presenter = .{
+        .opcode_base = present_ext.opcode_base,
+        .depth = root.depth,
+        .window_id = ids.window(),
+        .event_id = ids.presentEventId(),
+        .pixmaps = ids.presentPixmaps(),
+    };
+    try presenter.init(sink, window_size.x, window_size.y);
 
-    try x11.render.createPixmapPicture(
-        sink,
-        render_ext.opcode_base,
-        ids.pixmap(),
-        ids.dstPicture(),
-        ids.window().drawable(),
-        visual_format,
-        root.depth,
-        window_size.x,
-        window_size.y,
-    );
+    const dst_pictures = ids.dstPictures();
+    for (presenter.pixmaps, dst_pictures) |pixmap, picture| {
+        try x11.render.CreatePicture(sink, render_ext.opcode_base, picture, pixmap.drawable(), visual_format, .{});
+    }
 
     // Create a solid white Picture (source color for glyph compositing)
     try x11.render.CreateSolidFill(
@@ -277,8 +277,6 @@ fn run(
     var layout: Layout = .{
         .slider = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     };
-    var present_serial: u32 = 0;
-    var render_in_flight = false;
     var dirty = false;
 
     while (true) {
@@ -322,31 +320,20 @@ fn run(
                 if (window_size.x != msg.width or window_size.y != msg.height) {
                     std.log.info("WindowSize {}x{}", .{ msg.width, msg.height });
                     window_size = .{ .x = msg.width, .y = msg.height };
-                    try x11.render.recreatePixmapPicture(
-                        sink,
-                        render_ext.opcode_base,
-                        ids.pixmap(),
-                        ids.dstPicture(),
-                        ids.window().drawable(),
-                        visual_format,
-                        root.depth,
-                        window_size.x,
-                        window_size.y,
-                    );
+                    try presenter.resize(sink, window_size.x, window_size.y);
+                    for (presenter.pixmaps, dst_pictures) |pixmap, picture| {
+                        try x11.render.FreePicture(sink, render_ext.opcode_base, picture);
+                        try x11.render.CreatePicture(sink, render_ext.opcode_base, picture, pixmap.drawable(), visual_format, .{});
+                    }
                     dirty = true;
                 }
             },
             .GenericEvent => {
                 const event = try source.read2(.GenericEvent);
-                if (event.isPresentCompleteNotify(present_ext.opcode_base)) {
-                    const complete = try source.read3Full(.present_CompleteNotify);
-                    std.debug.assert(complete.event_id == ids.presentEventId());
-                    std.debug.assert(complete.window == ids.window());
-                    if (complete.serial == present_serial) {
-                        std.debug.assert(render_in_flight);
-                        render_in_flight = false;
-                    }
-                } else std.debug.panic("unexpected GenericEvent {}", .{event});
+                if (!try presenter.handleGenericEvent(source, &event)) std.debug.panic(
+                    "unexpected GenericEvent {}",
+                    .{event},
+                );
             },
             .MapNotify,
             .ReparentNotify,
@@ -354,11 +341,15 @@ fn run(
             => try source.discardRemaining(),
             else => std.debug.panic("unexpected X11 {f}", .{source.readFmtDropError()}),
         }
-        if (dirty and !render_in_flight) {
+        if (dirty) if (presenter.beginFrame()) |pixmap| {
+            const dst_picture = dst_pictures[presenter.back_buf];
             layout = render(
                 &glyph_arena,
                 sink,
-                ids,
+                ids.gc(),
+                pixmap,
+                dst_picture,
+                ids.srcPicture(),
                 &glyphs,
                 window_size,
                 font_size,
@@ -366,11 +357,9 @@ fn run(
             ) catch |err| switch (err) {
                 error.WriteFailed => return error.WriteFailed,
             };
-            present_serial +%= 1;
-            try x11.present.presentPixmap(sink, present_ext.opcode_base, ids.window(), ids.pixmap(), present_serial, 0, 0, 0);
-            render_in_flight = true;
+            try presenter.endFrame(sink);
             dirty = false;
-        }
+        };
     }
 }
 
@@ -410,14 +399,16 @@ const Layout = struct {
 fn render(
     glyph_arena: *ArenaAllocator,
     sink: *x11.RequestSink,
-    ids: Ids,
+    gc: x11.GraphicsContext,
+    pixmap: x11.Pixmap,
+    dst_picture: x11.render.Picture,
+    src_picture: x11.render.Picture,
     glyphs: *xtt.GlyphSet,
     window_size: XY(u16),
     font_size: f32,
     font_file: ?[]const u8,
 ) error{WriteFailed}!Layout {
-    const gc = ids.gc();
-    const drawable = ids.pixmap().drawable();
+    const drawable = pixmap.drawable();
 
     try sink.ChangeGc(gc, .{ .foreground = 0 });
     try sink.PolyFillRectangle(drawable, gc, .initAssume(&.{.{
@@ -453,10 +444,10 @@ fn render(
     var writer_buf: [16]u8 = undefined;
     var writer: xtt.Writer = .init(.{
         .glyph_set = glyphs,
-        .src_picture = ids.srcPicture(),
+        .src_picture = src_picture,
         .gpa = glyph_arena.allocator(),
         .sink = sink,
-        .dst_picture = ids.dstPicture(),
+        .dst_picture = dst_picture,
         .cursor = .{
             .x = margin,
             .y = 30,
